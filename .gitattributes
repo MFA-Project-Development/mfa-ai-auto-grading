@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# Default: let Git detect text vs binary, and normalize text to LF in the repo.
+# ---------------------------------------------------------------------------
+* text=auto eol=lf
+
+# ---------------------------------------------------------------------------
+# Source & config — force LF (this project runs in Linux containers)
+# ---------------------------------------------------------------------------
+*.py        text eol=lf
+*.pyi       text eol=lf
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.ini       text eol=lf
+*.cfg       text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.env       text eol=lf
+*.mako      text eol=lf
+*.sql       text eol=lf
+
+Dockerfile          text eol=lf
+.dockerignore       text eol=lf
+.gitignore          text eol=lf
+.gitattributes      text eol=lf
+requirements*.txt   text eol=lf
+
+# ---------------------------------------------------------------------------
+# Windows-only scripts — keep CRLF
+# ---------------------------------------------------------------------------
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# ---------------------------------------------------------------------------
+# Binary assets — never convert, never diff as text
+# ---------------------------------------------------------------------------
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.webp          binary
+*.ico           binary
+*.pdf           binary
+*.zip           binary
+*.tar           binary
+*.gz            binary
+*.7z            binary
+
+# ML model weights / caches
+*.gguf          binary
+*.bin           binary
+*.safetensors   binary
+*.pt            binary
+*.pth           binary
+*.onnx          binary
+*.ckpt          binary
+
+# SQLite / local DBs
+*.db            binary
+*.sqlite        binary
+*.sqlite3       binary
