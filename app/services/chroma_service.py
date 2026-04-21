@@ -86,13 +86,26 @@ def add_question_document(
     return doc_id
 
 
-def search_documents(query_embedding: list[float], top_k: int = 5) -> dict:
-    """Top-k semantic search over the answer-key collection."""
-    return _collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"],
-    )
+def search_documents(
+    query_embedding: list[float],
+    top_k: int = 5,
+    where: dict | None = None,
+) -> dict:
+    """Top-k semantic search over the answer-key collection.
+
+    ``where`` is an optional Chroma metadata filter, e.g.
+    ``{"file_id": "<uuid>"}`` to restrict results to a single uploaded
+    answer-key PDF. When omitted the search runs across the whole
+    collection (original behaviour).
+    """
+    kwargs: dict = {
+        "query_embeddings": [query_embedding],
+        "n_results": top_k,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        kwargs["where"] = where
+    return _collection.query(**kwargs)
 
 
 def get_documents_by_file_id(file_id: str, limit: int = 10000) -> dict:

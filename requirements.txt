@@ -36,11 +36,16 @@ Pillow==10.3.0
 # telemetry (already disabled in our code path), so this pin is safe.
 protobuf==3.20.2
 
-# Auto-grading VLM (Qwen2.5-VL-7B-Instruct). Install PyTorch from the
-# CUDA 13.1 wheel index to match the host driver, e.g.:
-#   pip install torch>=2.1.0 --index-url https://download.pytorch.org/whl/cu131
+# Auto-grading VLM (Qwen/Qwen2.5-VL-7B-Instruct) loaded with
+# bitsandbytes 4-bit NF4. On Blackwell (RTX 50-series) install
+# PyTorch from the CUDA 12.8 wheel index to match the host driver:
+#   pip install "torch>=2.5.0" --index-url https://download.pytorch.org/whl/cu128
+# NOTE: we intentionally do NOT depend on `autoawq` - it has no
+# supported Windows wheel (requires `triton`, which is Linux-only)
+# and its last release predates torch 2.11 / sm_120. `bitsandbytes`
+# 0.47+ is the Windows + Blackwell-friendly 4-bit path.
 torch>=2.1.0
 transformers>=4.49.0
-accelerate
+accelerate>=0.26.0
 qwen-vl-utils
-bitsandbytes
+bitsandbytes>=0.47.0

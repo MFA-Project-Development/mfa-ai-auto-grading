@@ -1,18 +1,24 @@
-"""Qwen2.5-VL-7B-Instruct-AWQ grading service.
+"""Qwen2.5-VL-7B-Instruct grading service (bitsandbytes 4-bit NF4).
 
 This module owns the vision-language model used to auto-grade a
 student's handwritten step-by-step solution. It is tuned for an
-RTX 5080 (16 GB VRAM, CUDA 13.1) and designed to stay under a ~14 GB
+RTX 5080 (16 GB VRAM, CUDA 12.8) and designed to stay under a ~14 GB
 peak allocation covering both the model weights and the per-request
 inference activations.
 
 Architecture
 ------------
 
-- **Model**: ``Qwen/Qwen2.5-VL-7B-Instruct-AWQ`` in ``float16``. AWQ is
-  a 4-bit activation-aware weight quantisation that ships natively in
-  recent ``transformers``; no ``bitsandbytes`` runtime is required.
-  Weights land in VRAM at roughly ~5 GB.
+- **Model**: ``Qwen/Qwen2.5-VL-7B-Instruct`` loaded with
+  :class:`~transformers.BitsAndBytesConfig` in 4-bit NF4 (double
+  quantisation, fp16 compute dtype). We load via ``bitsandbytes``
+  rather than AWQ because ``autoawq`` has no supported wheel on
+  Windows + Python 3.11 + torch 2.11 / CUDA 12.8 (Blackwell sm_120):
+  its ``triton`` dependency lacks a Windows wheel and the last
+  ``autoawq`` release predates torch 2.11. ``bitsandbytes`` 0.49+
+  ships native Windows wheels with Blackwell kernels, so NF4 4-bit
+  is the drop-in equivalent here. Weights land in VRAM at roughly
+  ~5-6 GB (comparable to the AWQ build).
 - **Resolution cap**: the processor is pinned to the range
   ``[256*28*28, 512*28*28]`` pixels (200,704 - 401,408). This single
   knob is the biggest lever on peak VRAM - a 12 MP phone photo would
@@ -62,8 +68,8 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------- constants
 
-MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"
-MODEL_DISPLAY_NAME = "Qwen2.5-VL-7B-Instruct-AWQ"
+MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+MODEL_DISPLAY_NAME = "Qwen2.5-VL-7B-Instruct (bnb-4bit)"
 
 # Image-resolution bounds in pixels. Qwen2.5-VL tiles the image into
 # 28x28 patches; clamping both ends of the range keeps the visual
@@ -107,8 +113,11 @@ _SYSTEM_PROMPT = (
 )
 
 # Double-braces ({{ / }}) are str.format escapes for literal { / }.
-# Single-braced {question}, {answer_key}, {max_score}, {subject} are
-# the real substitution points.
+# Single-braced {question}, {answer_key}, {max_score}, {subject},
+# {label_hint} are the real substitution points. ``{label_hint}`` is
+# filled by ``_build_messages`` - either an empty string or a line
+# telling the model the exact question-number label to strip (we know
+# it when the request came through ``/submit-by-image``).
 _USER_PROMPT_TEMPLATE = """Grade this handwritten math solution.
 
 Question: {question}
@@ -116,24 +125,80 @@ Full correct solution (answer key):
 {answer_key}
 Maximum score: {max_score}
 Subject: {subject}
+{label_hint}
+STEP 1 - READ the handwriting and TRANSCRIBE the math:
+For EACH line of mathematical working the student wrote, emit ONE
+entry in ``extracted_steps`` with its ``student_wrote`` field set
+to the math content of that line.
 
-STEP 1 - READ the handwriting:
-Transcribe every line the student wrote, exactly as written.
-Do not skip any lines. Do not correct anything yet.
+DO NOT skip any lines. In particular, ALWAYS include the student's
+LAST line (the final answer they arrived at) as its own entry in
+``extracted_steps``. Missing the final line is a common failure;
+count the visible "=" signs on the page and make sure you emitted
+at least that many step entries plus one for the starting expression.
+
+CRITICAL - Question labels are NOT math. Strip them before writing
+``student_wrote``:
+Question labels like "1.", "Q3", "0003.", "Question 5:", "(3)" at
+the very start of the page are METADATA. They MUST NOT appear in
+``student_wrote``. A label's presence is NEVER grounds for
+``is_correct: false`` - strip it, then compare.
+
+Example - this is the exact failure mode to avoid:
+  Page starts with:  "0003. (3x^2+2xy-y^2)-(x^2-5xy-4y^2)"
+
+  CORRECT output:
+    {{"step_number": 1,
+      "student_wrote": "(3x^2+2xy-y^2)-(x^2-5xy-4y^2)",
+      "expected":      "(3x^2+2xy-y^2)-(x^2-5xy-4y^2)",
+      "is_correct": true, "error": null}}
+
+  WRONG output (do NOT produce this):
+    {{"step_number": 1,
+      "student_wrote": "0003. (3x^2+2xy-y^2)-(x^2-5xy-4y^2)",
+      "is_correct": false,
+      "error": "includes question label"}}
+
+If the student copied the starting expression correctly, step 1
+is correct regardless of any label on the page.
 
 STEP 2 - VERIFY each step:
-Compare each transcribed step against the answer key.
+The answer key lists the expected steps in order as "Step 1",
+"Step 2", ... Match student line N against the answer key's
+Step N (same number). In the ``expected`` field for each student
+step, put the answer key's Step N text. Do NOT put the final
+answer there unless this IS the final-answer step.
 
 CRITICAL VERIFICATION RULES:
-- Rule 1: Step 1 must show the EXACT expression from the question.
-  Check every coefficient and sign individually.
-  (2x^2-xy+3y^2) != (x^2+xy+3y^2) -> step 1 is WRONG.
-- Rule 2: Each step must follow mathematically from the previous.
-  Check every coefficient, sign, and variable character by character.
+- Rule 0: Strip question labels before comparing. A leading "Q3.",
+  "0003.", "(3)", "Question 5:" at the top of the student's page is
+  a question NUMBER, not a coefficient or part of the math. Never
+  flag it as a coefficient mismatch against the expected expression.
+- Rule 1: After stripping the label, step 1 must show the EXACT
+  expression from the question (this is also the answer key's
+  Step 1 "starting expression"). Check every coefficient and sign
+  individually. (2x^2-xy+3y^2) != (x^2+xy+3y^2) -> step 1 is WRONG.
+- Rule 2: Each subsequent student step must (a) follow mathematically
+  from the previous student step AND (b) match the answer key's step
+  with the same number, character by character on coefficients and
+  signs.
 - Rule 3: If step N is wrong, steps after it that use the wrong
   result are 'affected by step N error' - note dependency but
   do not penalise the method again if approach is still valid.
 - Rule 4: Award marks proportionally per correct step.
+- Rule 5 (FINAL ANSWER PRIORITY): If the student's LAST step
+  contains the expected "Final answer" (ignoring a leading "=" and
+  whitespace), the student reached the correct result. In that case
+  award full marks regardless of uncertainty in any intermediate
+  step - the correct final answer is strong evidence that the
+  intermediate work is mathematically valid.
+- Rule 6 (HANDWRITING AMBIGUITY): Cursive digits can be ambiguous
+  (3 vs 8, 1 vs 7, 0 vs 6, 4 vs 9). When a character is unclear,
+  use mathematical consistency to resolve it: if reading it one way
+  makes the transformation follow logically from the previous step
+  AND reading the other way does not, choose the reading that makes
+  the math work. Never mark a step wrong because of an ambiguous
+  character that has a correct reading.
 
 OUTPUT RULES (strictly follow):
 - Output RAW JSON only
@@ -268,7 +333,11 @@ def _load_model() -> None:
 
         try:
             import torch
-            from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+            from transformers import (
+                AutoProcessor,
+                BitsAndBytesConfig,
+                Qwen2_5_VLForConditionalGeneration,
+            )
         except Exception:
             logger.exception(
                 "grading: transformers/torch not installed; grading endpoint will 503"
@@ -278,21 +347,42 @@ def _load_model() -> None:
         if not torch.cuda.is_available():
             logger.error(
                 "grading: CUDA is not available on this host; "
-                "Qwen2.5-VL-AWQ requires a GPU. Grading endpoint will 503."
+                "Qwen2.5-VL bnb-4bit requires a GPU. Grading endpoint will 503."
+            )
+            return
+
+        try:
+            import bitsandbytes  # noqa: F401
+        except Exception:
+            logger.exception(
+                "grading: bitsandbytes not installed; "
+                "grading endpoint will 503. Install via `pip install bitsandbytes`."
             )
             return
 
         _device = "cuda"
 
+        # NF4 4-bit with double-quant and fp16 compute dtype:
+        # - ~5-6 GB of VRAM for the 7B weights (vs ~14 GB in fp16)
+        # - compute in fp16 keeps activation math in the same dtype the
+        #   vision encoder already uses, avoiding a bf16<->fp16 hop.
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+
         try:
             logger.info(
-                "grading: loading %s in float16 on %s (AWQ weights)...",
+                "grading: loading %s with bnb 4-bit NF4 on %s...",
                 MODEL_ID,
                 _device,
             )
             _model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 MODEL_ID,
-                torch_dtype=torch.float16,
+                quantization_config=quant_config,
+                dtype=torch.float16,
                 device_map=_device,
             )
             _processor = AutoProcessor.from_pretrained(
@@ -465,6 +555,329 @@ def _clamp_score(value: Any, max_score: int) -> int:
     return score
 
 
+def _label_prefix_variants(label: str) -> list[str]:
+    """Return common ways a student might write a question label at the
+    top of their page.
+
+    We try these in order of *longest first* when stripping so the most
+    specific form wins (e.g. we prefer to strip ``"0003."`` over
+    ``"0003"`` alone, to avoid leaving a stray ``"."``).
+    """
+    clean = str(label or "").strip()
+    if not clean:
+        return []
+
+    variants: list[str] = []
+    # Canonical and punctuation variants.
+    for suffix in ("", ".", ")", ":", " -", " -"):
+        variants.append(f"{clean}{suffix}")
+        variants.append(f"Q{clean}{suffix}")
+        variants.append(f"({clean}){suffix}".rstrip())
+    variants.append(f"Question {clean}")
+    variants.append(f"Question {clean}:")
+    variants.append(f"Question {clean}.")
+
+    # Also try without leading zeros ("0003" -> "3") since students often
+    # write the compact form even when the canonical label is zero-padded.
+    if clean.isdigit() and clean.startswith("0"):
+        trimmed = clean.lstrip("0") or "0"
+        for suffix in ("", ".", ")", ":"):
+            variants.append(f"{trimmed}{suffix}")
+            variants.append(f"Q{trimmed}{suffix}")
+            variants.append(f"({trimmed}){suffix}".rstrip())
+
+    # Dedup, preserve order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _strip_leading_label(text: str, variants: list[str]) -> str:
+    """Strip the longest matching label variant from ``text``'s left edge.
+
+    A variant is only accepted when it is clearly *standalone*, i.e. the
+    character right after it is either:
+
+    - end-of-string, or
+    - whitespace (the student wrote "0003. (3x^2...)" with a space), or
+    - a punctuation-to-math boundary *when the variant itself ends in
+      punctuation* (the student wrote "0003.(3x^2...)" with no space).
+
+    This prevents false-positive strips against genuine math like
+    ``"3x^2 + 4"`` (variant ``"3"`` would match the leading coefficient)
+    or ``"3.141"`` (variant ``"3."`` would match the integer part).
+
+    Returns the original ``text`` unchanged if no variant matched
+    under those constraints.
+    """
+    if not text:
+        return text
+    stripped = text.lstrip()
+
+    # Try longest first so "0003." beats "0003".
+    for v in sorted(variants, key=len, reverse=True):
+        if not v:
+            continue
+        if not stripped.lower().startswith(v.lower()):
+            continue
+
+        after_idx = len(v)
+        # Whole string was just the label.
+        if after_idx >= len(stripped):
+            return ""
+
+        next_char = stripped[after_idx]
+
+        # Safe case: label is followed by whitespace (the normal way
+        # students write "0003. <math>" with a space between).
+        if next_char.isspace():
+            return stripped[after_idx:].lstrip()
+
+        # Edge case: label ends in punctuation AND the next char is not
+        # alphanumeric. Covers "0003.(3x^2..." with no space, while
+        # still rejecting "3.141" (variant "3." followed by "1" which
+        # IS alphanumeric) and "3x^2" (variant "3" doesn't end in
+        # punctuation so this branch does not trigger).
+        if v[-1] in ".):-" and not next_char.isalnum():
+            return stripped[after_idx:].lstrip()
+
+    return text
+
+
+_MATH_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _math_normalize(text: str) -> str:
+    """Collapse whitespace and lower-case for tolerant math equality."""
+    return _MATH_WHITESPACE_RE.sub("", str(text or "")).lower()
+
+
+def _repair_question_label_in_step1(
+    data: dict[str, Any], question_label: str | None
+) -> None:
+    """Detect and undo the "label polluted student_wrote" failure mode.
+
+    Context: even with prompt instructions to strip question labels, the
+    VLM sometimes writes the label into ``student_wrote`` *and* marks
+    ``is_correct: false`` citing the label's presence as the error.
+    This helper runs on the parsed dict after JSON extraction and
+    *before* ``_validate_score``.
+
+    For the first extracted step, when a known ``question_label`` was
+    supplied by the route layer (``/submit-by-image`` knows it):
+
+    1. Strip any leading label variant from ``student_wrote``.
+    2. If the stripped transcription now matches ``expected`` under
+       whitespace-insensitive comparison, flip ``is_correct`` to True,
+       clear the ``error`` field, and fix up top-level
+       ``first_error_step`` / ``error_summary`` so the response is
+       internally consistent.
+    3. If ``student_wrote`` did not start with a label we leave
+       everything alone - we never silently upgrade a genuine math error.
+
+    All mutations are logged at WARNING level so we can audit how often
+    the model needs bailing out.
+    """
+    if not question_label:
+        return
+
+    steps = data.get("extracted_steps")
+    if not isinstance(steps, list) or not steps:
+        return
+
+    first = steps[0]
+    if not isinstance(first, dict):
+        return
+
+    variants = _label_prefix_variants(str(question_label))
+    if not variants:
+        return
+
+    original = str(first.get("student_wrote") or "")
+    stripped = _strip_leading_label(original, variants)
+    if stripped == original:
+        return  # no leading label present
+
+    logger.warning(
+        "grading: repair stripped question label %r from step 1 student_wrote: "
+        "%r -> %r",
+        question_label,
+        original[:80],
+        stripped[:80],
+    )
+    first["student_wrote"] = stripped
+
+    expected = str(first.get("expected") or "")
+    if expected and _math_normalize(stripped) == _math_normalize(expected):
+        if not first.get("is_correct"):
+            logger.warning(
+                "grading: repair flipped step 1 is_correct False -> True "
+                "(student_wrote matches expected after label strip)"
+            )
+        first["is_correct"] = True
+        first["error"] = None
+
+        # Recompute first_error_step: find the first remaining
+        # is_correct=False step, or null if all correct.
+        new_first_err: int | None = None
+        for s in steps:
+            if isinstance(s, dict) and not s.get("is_correct", True):
+                try:
+                    new_first_err = int(s.get("step_number"))
+                except (TypeError, ValueError):
+                    new_first_err = None
+                break
+        data["first_error_step"] = new_first_err
+
+        # Nuke a stale error_summary that was pointing at step 1's label.
+        err_summary = str(data.get("error_summary") or "").lower()
+        if (
+            "label" in err_summary
+            or "question number" in err_summary
+            or "0003" in err_summary  # defensive against the exact failure mode
+            or question_label.lower() in err_summary
+        ):
+            data["error_summary"] = (
+                None if new_first_err is None else data.get("error_summary")
+            )
+
+
+def _normalize_final_answer(text: Any) -> str:
+    """Normalise an answer string for tolerant final-answer equality.
+
+    Strips a leading ``=`` (students often write ``"= x+2"``), drops
+    common Korean / English answer-prefix tokens (``"답"``, ``"ans"``,
+    ``"Answer:"``), whitespace, and lower-cases. Returns the
+    comparison key, not a user-facing string.
+    """
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    # Strip leading "= " that students prepend on a new line.
+    while s.startswith("="):
+        s = s[1:].lstrip()
+    # Drop common answer-word prefixes (case-insensitive, Korean inclusive).
+    lower = s.lower()
+    for prefix in ("answer:", "ans:", "answer ", "ans ", "=>"):
+        if lower.startswith(prefix):
+            s = s[len(prefix):].lstrip()
+            break
+    # Korean "답" prefix (with or without colon/whitespace).
+    if s.startswith("\uB2F5"):  # 답
+        s = s[1:].lstrip(": ").strip()
+    return _math_normalize(s)
+
+
+def _repair_final_answer_match(
+    data: dict[str, Any],
+    expected_final_answer: str | None,
+    max_score: int,
+) -> None:
+    """Safety net: if any extracted step matches the expected final answer,
+    upgrade the overall grading to full marks.
+
+    Rationale
+    ---------
+
+    When the student writes the correct final answer on their paper,
+    they have reached the correct result. Intermediate-step
+    transcription noise (e.g. the VLM reads cursive "3" as "8") is the
+    grader's problem, not the student's - so a correct final answer
+    must win over flagged intermediate steps.
+
+    We check **all** extracted steps (not just the last) because the
+    VLM sometimes drops the trailing line or collapses it into the
+    previous step; as long as the expected final answer appears
+    somewhere in the student's transcribed work, credit it.
+
+    Mutations (all logged at WARNING for auditability):
+
+    - ``student_score`` bumped to ``max_score``.
+    - ``is_correct`` -> ``True``; ``method_correct`` -> ``True``.
+    - The step whose text matched is flipped to ``is_correct=True`` and
+      its ``error`` cleared.
+    - ``first_error_step`` is recomputed; set to ``None`` when every
+      step is now correct.
+
+    No-op when:
+
+    - ``expected_final_answer`` is falsy (manual ``/submit`` path).
+    - No extracted step matches the expected final answer.
+    """
+    if not expected_final_answer:
+        return
+
+    expected_norm = _normalize_final_answer(expected_final_answer)
+    if not expected_norm:
+        return
+
+    steps = data.get("extracted_steps")
+    if not isinstance(steps, list) or not steps:
+        return
+
+    match_idx: int | None = None
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        if _normalize_final_answer(step.get("student_wrote")) == expected_norm:
+            match_idx = i
+            break
+
+    if match_idx is None:
+        return  # student never wrote the expected final answer
+
+    current_score = _clamp_score(data.get("student_score", 0), max_score)
+    was_score = current_score
+    was_is_correct = bool(data.get("is_correct"))
+    was_method_correct = bool(data.get("method_correct"))
+
+    # Flip the matching step if it was flagged (rare but possible).
+    match_step = steps[match_idx]
+    if not match_step.get("is_correct", False):
+        logger.warning(
+            "grading: final-answer safety net flipping step %s is_correct "
+            "False -> True (text matches expected final answer %r)",
+            match_step.get("step_number"),
+            expected_final_answer,
+        )
+        match_step["is_correct"] = True
+        match_step["error"] = None
+
+    # Upgrade top-level fields.
+    data["student_score"] = max_score
+    data["is_correct"] = True
+    data["method_correct"] = True
+
+    # Recompute first_error_step from the (possibly just-flipped) step
+    # list: the first still-incorrect step, or None when all correct.
+    new_first_err: int | None = None
+    for s in steps:
+        if isinstance(s, dict) and not s.get("is_correct", True):
+            try:
+                new_first_err = int(s.get("step_number"))
+            except (TypeError, ValueError):
+                new_first_err = None
+            break
+    data["first_error_step"] = new_first_err
+
+    if was_score != max_score or not was_is_correct or not was_method_correct:
+        logger.warning(
+            "grading: final-answer safety net engaged - student reached the "
+            "correct final answer %r (matched in step %s); boosting "
+            "score %d -> %d, is_correct %s -> True, method_correct %s -> True",
+            expected_final_answer,
+            match_step.get("step_number"),
+            was_score,
+            max_score,
+            was_is_correct,
+            was_method_correct,
+        )
+
+
 def _validate_score(data: dict[str, Any], max_score: int) -> dict[str, Any]:
     """Apply score-related sanity checks to ``data`` in place.
 
@@ -605,18 +1018,39 @@ def _build_messages(
     subject: str,
     *,
     strict_retry: bool,
+    question_label: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build the Qwen2.5-VL chat-template messages for one grading call.
 
     The conversation is split into a system message (role definition)
     and a multi-modal user message carrying the PIL image plus the
     step-by-step grading instructions.
+
+    ``question_label`` is the canonical label of the item being graded
+    (e.g. ``"0003"``) when known - typically populated by
+    ``/submit-by-image`` from the resolved ``AnswerKeyItem.question_no``.
+    When supplied, the prompt gains a concrete hint telling the model
+    exactly which string to treat as a question label and strip from
+    the transcription. When omitted, the generic "strip any leading
+    label" guidance still applies.
     """
+    label_hint = ""
+    if question_label and str(question_label).strip():
+        clean = str(question_label).strip()
+        label_hint = (
+            f"Note: this paper is for question number \"{clean}\". "
+            f"The student may write \"{clean}\", \"{clean}.\", \"Q{clean}\", "
+            f"or similar as a label at the top of the page - that is a "
+            f"question identifier, NOT part of the math expression. Strip "
+            f"it before comparing to the expected step 1.\n"
+        )
+
     user_prompt = _USER_PROMPT_TEMPLATE.format(
         question=question,
         answer_key=answer_key,
         max_score=max_score,
         subject=subject,
+        label_hint=label_hint,
     )
     if strict_retry:
         user_prompt = user_prompt + _STRICT_RETRY_SUFFIX
@@ -633,13 +1067,21 @@ def _build_messages(
     ]
 
 
-def _run_generation(messages: list[dict[str, Any]]) -> str:
+def _run_generation(
+    messages: list[dict[str, Any]],
+    *,
+    max_new_tokens: int = _MAX_NEW_TOKENS_PASS,
+) -> str:
     """Run one ``model.generate`` pass and return the decoded string.
 
     Must be called with :data:`_generate_lock` held so two concurrent
     grading requests do not trample each other on the shared GPU.
     Explicitly drops the ``inputs`` tensor and empties the allocator
     cache after decoding so the next request sees a compacted pool.
+
+    ``max_new_tokens`` defaults to the full grading budget; pass a
+    tighter value (e.g. 128) for short-form passes like question
+    identification.
 
     Raises
     ------
@@ -665,7 +1107,7 @@ def _run_generation(messages: list[dict[str, Any]]) -> str:
         with torch.inference_mode():
             generated_ids = _model.generate(
                 **inputs,
-                max_new_tokens=_MAX_NEW_TOKENS_PASS,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
             )
 
@@ -732,6 +1174,8 @@ def _grade_sync(
     answer_key: str,
     max_score: int,
     subject: str,
+    question_label: str | None = None,
+    expected_final_answer: str | None = None,
 ) -> dict[str, Any]:
     """Blocking implementation of :func:`grade_answer`.
 
@@ -773,6 +1217,7 @@ def _grade_sync(
         messages = _build_messages(
             pil_image, question, answer_key, max_score, subject,
             strict_retry=False,
+            question_label=question_label,
         )
         raw = _run_generation(messages)
 
@@ -792,6 +1237,7 @@ def _grade_sync(
             messages = _build_messages(
                 pil_image, question, answer_key, max_score, subject,
                 strict_retry=True,
+                question_label=question_label,
             )
             raw = _run_generation(messages)
             try:
@@ -827,7 +1273,20 @@ def _grade_sync(
         )
         return result
 
-    # --- Happy path: score validation + response envelope -----------
+    # --- Happy path: repair known failure modes, then validate --------
+    # Order matters:
+    #   1. Strip question label from step 1 (may flip step 1 correct).
+    #   2. Final-answer safety net (may flip overall correct + full marks
+    #      when the student reached the right answer despite intermediate
+    #      transcription noise like cursive 3 vs 8).
+    #   3. _validate_score (clamps, score=0 override, first_error_step
+    #      back-fill, score_breakdown).
+    # Both repair helpers are no-ops when their respective hints weren't
+    # supplied by the route (i.e. the manual /submit path runs with
+    # both as None and lands directly at _validate_score).
+    _repair_question_label_in_step1(data, question_label)
+    _repair_final_answer_match(data, expected_final_answer, max_score)
+
     _validate_score(data, max_score)
     extracted_steps = _sanitize_steps(data.get("extracted_steps"))
 
@@ -880,6 +1339,8 @@ async def grade_answer(
     answer_key: str,
     max_score: int = 10,
     subject: str = "math",
+    question_label: str | None = None,
+    expected_final_answer: str | None = None,
 ) -> dict[str, Any]:
     """Grade a single handwritten answer image.
 
@@ -906,6 +1367,26 @@ async def grade_answer(
     subject:
         Free-form subject hint ("math", "physics", ...) used as extra
         grading context.
+    question_label:
+        Canonical question-number label (e.g. ``"0003"``) when the
+        caller already knows it - typically populated by
+        ``/submit-by-image`` from the resolved ``AnswerKeyItem.question_no``.
+        When supplied, the grading prompt gains an explicit hint telling
+        the model exactly which string to strip from the top of the
+        student's page before comparing step 1 to the expected
+        expression. Prevents the classic failure mode where the VLM
+        transcribes the label (e.g. ``"0003."``) as part of the math and
+        then flags it as a coefficient mismatch.
+    expected_final_answer:
+        The canonical final answer for this question when known -
+        typically ``AnswerKeyItem.normalized_answer`` (or ``.final_answer``
+        as fallback) from the resolver. When supplied, a server-side
+        safety net in ``_grade_sync`` inspects the parsed response: if
+        the student's transcribed work contains the expected final
+        answer (whitespace- and ``=``-insensitive), grading is upgraded
+        to full marks regardless of intermediate-step transcription
+        noise. Protects against VLM OCR errors on cursive digits
+        (3 vs 8, 1 vs 7, ...) in intermediate lines.
 
     Returns
     -------
@@ -935,7 +1416,160 @@ async def grade_answer(
         answer_key,
         max_score,
         subject,
+        question_label,
+        expected_final_answer,
     )
+
+
+# --------------------------------------------------------------------- question identification
+# A short, low-token Qwen pass that reads the *top* of a handwritten
+# page and extracts either the question number the student wrote or
+# the problem statement they copied. The caller then uses those hints
+# to pick the correct ``AnswerKeyItem`` via either exact SQL lookup
+# (on ``(file_id, question_no)``) or semantic similarity in Chroma.
+#
+# This is deliberately a separate, tiny generation pass (~128 tokens)
+# because the full grading pass is slow and bundling "identify + grade"
+# into one prompt would (a) bloat the output-token budget and (b)
+# force the VLM to simultaneously read AND reason, which empirically
+# hurts both tasks.
+
+_IDENTIFY_SYSTEM_PROMPT = (
+    "You are reading a student's handwritten math work to identify "
+    "which question they are answering. Do NOT grade. Do NOT solve."
+)
+
+_IDENTIFY_USER_PROMPT = """Look at the top of this handwritten page. Extract:
+
+1. question_number: if the student wrote a question number at the top
+   of the page (e.g. "1.", "Q3", "Question 2", "#5", "2.a") return
+   just the number/identifier as a short string. If no question number
+   is visible, return null.
+
+2. problem_text: if the student copied the problem statement from the
+   exam paper at the top of their page (typically the first 1-3 lines,
+   before any working), return it as a single line. If the page only
+   contains working/calculation with no restated problem, return null.
+
+3. read_confidence: "high" if the handwriting at the top is clearly
+   legible; "medium" if partially legible; "low" if mostly illegible.
+
+OUTPUT RULES:
+- Output RAW JSON only
+- No prose, no markdown fences, no ```json
+- Start your response with { and end with }
+- Example: {"question_number": "3", "problem_text": null, "read_confidence": "high"}"""
+
+# Short output budget. The JSON envelope is 60-120 tokens in practice;
+# 128 leaves a little headroom without letting the model run on.
+_IDENTIFY_MAX_NEW_TOKENS = int(os.getenv("GRADING_IDENTIFY_MAX_NEW_TOKENS", "128"))
+
+
+def _identify_sync(image_bytes: bytes) -> dict[str, Any]:
+    """Blocking implementation of :func:`identify_question`.
+
+    Shares the singleton model + :data:`_generate_lock` with the main
+    grading pass. Returns a dict with three keys - ``question_number``,
+    ``problem_text``, ``read_confidence`` - any of which may be
+    ``None`` / ``"low"`` when the handwriting at the top of the page
+    is missing or illegible. On JSON parse failure we fall back to a
+    zero-signal response rather than raising, so the caller can still
+    ask the student to disambiguate via the 422 path.
+    """
+    if not is_ready():
+        raise GradingServiceUnavailable(
+            "Grading model is not loaded (see startup logs for details)."
+        )
+
+    pil_image = _decode_image(image_bytes)
+
+    if not _generate_lock.acquire(blocking=False):
+        raise GradingBusy(
+            "A previous grading request is still running on the GPU; "
+            "retry shortly."
+        )
+
+    t_start = time.perf_counter()
+    try:
+        messages = [
+            {"role": "system", "content": _IDENTIFY_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_image},
+                    {"type": "text", "text": _IDENTIFY_USER_PROMPT},
+                ],
+            },
+        ]
+        raw = _run_generation(messages, max_new_tokens=_IDENTIFY_MAX_NEW_TOKENS)
+    finally:
+        _generate_lock.release()
+
+    elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+
+    try:
+        data = _parse_json_response(raw)
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "identify: JSON parse failed (%s); returning zero-signal result. "
+            "raw head=%r",
+            exc,
+            raw[:200],
+        )
+        return {
+            "question_number": None,
+            "problem_text": None,
+            "read_confidence": "low",
+        }
+
+    qn = _coerce_optional_str(data.get("question_number"))
+    pt = _coerce_optional_str(data.get("problem_text"))
+    rc = _normalize_confidence(data.get("read_confidence"))
+
+    logger.info(
+        "identify: question_number=%r problem_text_len=%d read_confidence=%s "
+        "elapsed_ms=%.1f vram_used_mb=%d",
+        qn,
+        len(pt or ""),
+        rc,
+        elapsed_ms,
+        _vram_used_mb(),
+    )
+
+    return {
+        "question_number": qn,
+        "problem_text": pt,
+        "read_confidence": rc,
+    }
+
+
+async def identify_question(image_bytes: bytes) -> dict[str, Any]:
+    """Extract question identifiers from a student's handwritten page.
+
+    Runs a short Qwen2.5-VL pass (~128 tokens) and returns whichever of
+    ``question_number`` / ``problem_text`` the model could read from the
+    top of the page. Callers feed the result into
+    :func:`app.services.question_resolver.resolve_question` to pick the
+    matching :class:`AnswerKeyItem`.
+
+    Returns
+    -------
+    dict
+        ``{"question_number": str | None,
+           "problem_text":    str | None,
+           "read_confidence": "high" | "medium" | "low"}``
+
+    Raises
+    ------
+    GradingServiceUnavailable
+        Model failed to load at startup.
+    GradingBusy
+        Another grading request is holding the GPU.
+    ValueError
+        ``image_bytes`` could not be decoded.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _identify_sync, image_bytes)
 
 
 # --------------------------------------------------------------------- eager load
