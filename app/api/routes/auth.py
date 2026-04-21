@@ -1,18 +1,14 @@
-"""Authentication & example authorisation routes.
+"""Authentication routes.
 
 Public endpoints (no bearer required):
 
 * ``POST /login`` - exchanges email + password for a Keycloak access token
   via the OIDC password grant. Credentials never touch the database; we
   only proxy them to Keycloak's token endpoint.
-* ``GET  /health`` - liveness probe.
 
 Protected endpoints (require a valid bearer token):
 
 * ``GET /me`` - any authenticated user (returns :class:`CurrentUser`).
-* ``GET /admin-only`` - requires ``ROLE_ADMIN``.
-* ``GET /instructor-only`` - requires ``ROLE_INSTRUCTOR`` or ``ROLE_ADMIN``.
-* ``GET /student-only`` - requires ``ROLE_STUDENT``.
 """
 
 from __future__ import annotations
@@ -25,7 +21,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from app.core.config import settings
 from app.core.models import CurrentUser
-from app.core.security import get_current_user, require_role
+from app.core.security import get_current_user
 
 
 logger = logging.getLogger(__name__)
@@ -67,12 +63,6 @@ class TokenResponse(BaseModel):
 
 
 # --- routes -----------------------------------------------------------------
-
-
-@router.get("/health")
-def health() -> dict[str, str]:
-    """Public liveness probe. No authentication required."""
-    return {"status": "ok"}
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -139,27 +129,3 @@ async def login(payload: LoginRequest) -> TokenResponse:
 def me(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
     """Return the caller's identity as reconstructed from their JWT."""
     return user
-
-
-@router.get("/admin-only")
-def admin_only(
-    user: CurrentUser = Depends(require_role("ROLE_ADMIN")),
-) -> dict[str, object]:
-    """Admin-scoped endpoint. Rejects tokens without ``ROLE_ADMIN``."""
-    return {"message": "Hello admin", "user": user.preferred_username}
-
-
-@router.get("/instructor-only")
-def instructor_only(
-    user: CurrentUser = Depends(require_role("ROLE_INSTRUCTOR", "ROLE_ADMIN")),
-) -> dict[str, object]:
-    """Instructor-scoped endpoint (admins are also allowed through)."""
-    return {"message": "Hello instructor", "user": user.preferred_username}
-
-
-@router.get("/student-only")
-def student_only(
-    user: CurrentUser = Depends(require_role("ROLE_STUDENT")),
-) -> dict[str, object]:
-    """Student-scoped endpoint. Rejects tokens without ``ROLE_STUDENT``."""
-    return {"message": "Hello student", "user": user.preferred_username}

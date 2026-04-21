@@ -8,7 +8,6 @@ from app.api.routes.auth import router as auth_router
 from app.api.routes.delete import router as delete_router
 from app.api.routes.detail import router as detail_router
 from app.api.routes.grading import router as grading_router
-from app.api.routes.search import router as search_router
 from app.api.routes.upload import router as upload_router
 from app.core.config import settings
 from app.core.security import get_current_user, init_jwks_cache
@@ -82,14 +81,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 
 # Every non-auth router is locked behind a valid bearer token. The auth
-# router is mounted without a global guard so ``/login`` and ``/health``
-# stay reachable; its own protected endpoints (``/me``, ``/admin-only``,
-# ...) declare the dependency per-route.
+# router is mounted without a global guard so ``/login`` stays
+# reachable; its own protected endpoint (``/me``) declares the
+# dependency per-route.
 _auth_required = [Depends(get_current_user)]
 
 app.include_router(auth_router)
 app.include_router(upload_router, dependencies=_auth_required)
-app.include_router(search_router, dependencies=_auth_required)
 app.include_router(detail_router, dependencies=_auth_required)
 app.include_router(delete_router, dependencies=_auth_required)
 # Grading endpoints further restrict access to ROLE_INSTRUCTOR / ROLE_ADMIN

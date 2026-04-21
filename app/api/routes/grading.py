@@ -1,15 +1,17 @@
-"""Auto-grading HTTP endpoint.
+"""Auto-grading HTTP endpoints.
 
-Exposes a single ``POST /api/v1/grading/submit`` route that accepts a
-handwritten answer image plus the question / answer-key metadata and
-returns a machine-generated grade produced by Qwen2.5-VL-7B-Instruct
-(see :mod:`app.services.grading_service`).
+Exposes the auto-detect grading routes
+(``POST /api/v1/grading/submit-by-image`` and
+``POST /api/v1/grading/submit-multi-by-image``) that accept a handwritten
+answer image plus a ``file_id`` and return machine-generated grades
+produced by Qwen2.5-VL-7B-Instruct (see
+:mod:`app.services.grading_service`).
 
 Authorisation
 -------------
 
-The endpoint is restricted to callers holding ``ROLE_INSTRUCTOR`` or
-``ROLE_ADMIN``. Students may **not** call this endpoint - the
+Every endpoint is restricted to callers holding ``ROLE_INSTRUCTOR`` or
+``ROLE_ADMIN``. Students may **not** call these endpoints - the
 :func:`app.core.security.require_role` dependency rejects any token
 without one of those roles with HTTP 403.
 
@@ -23,7 +25,7 @@ Empty image / unreadable bytes                     400
 Unsupported content-type (not jpg/png/webp)        400
 Image payload exceeds ``_MAX_IMAGE_BYTES``         400
 Model not loaded / CUDA OOM at startup             503
-Generation exceeds ``_GRADING_TIMEOUT_SECONDS``    504
+Generation exceeds the configured timeout          504
 =================================================  ==================
 """
 
@@ -49,8 +51,6 @@ from app.services.grading_service import (
     grade_answer,
     identify_all_questions,
     identify_question,
-    is_ready,
-    load_error,
 )
 from app.services.question_resolver import (
     AmbiguousMatchError,
@@ -91,33 +91,14 @@ _MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
     (b"RIFF", "image/webp"),  # followed by 'WEBP' at offset 8
 )
 
-# Hard wall-clock budget for a single grading call.
-#
-# Cold-start generous budget: on the very first request after process boot
-# the vision encoder has to JIT-compile its CUDA kernels (especially on
-# newer GPUs like the RTX 50-series where cuDNN has to autotune from
-# scratch), which can easily take 30-60s. Subsequent calls complete in
-# 5-15s. We default to 120s so the first call doesn't reliably 504.
-#
-# Override at deploy time with the ``GRADING_TIMEOUT_SECONDS`` env var.
-_GRADING_TIMEOUT_SECONDS = float(os.getenv("GRADING_TIMEOUT_SECONDS", "120"))
-
-# ``/submit-by-image`` does two Qwen passes (identify then grade) so it
-# needs a larger end-to-end budget than the manual-override ``/submit``
-# endpoint. The identify pass is cheap (~2-5s) but the grading pass
-# can still take 30-60s on a cold GPU; 180s gives both rooms without
-# being so long that stuck requests back up the executor pool.
+# ``/submit-by-image`` does two Qwen passes (identify then grade) and
+# needs a generous end-to-end budget. The identify pass is cheap
+# (~2-5s) but the grading pass can still take 30-60s on a cold GPU;
+# 180s gives both rooms without being so long that stuck requests back
+# up the executor pool. ``/submit-multi-by-image`` reuses the same
+# per-question budget, capped by ``_MAX_QUESTIONS_PER_IMAGE``.
 _GRADING_BY_IMAGE_TIMEOUT_SECONDS = float(
     os.getenv("GRADING_BY_IMAGE_TIMEOUT_SECONDS", "180")
-)
-
-# ``/submit-multi-by-image`` performs one identify pass plus one
-# grading pass PER detected question. Each grading pass can take
-# 30-60s on a cold GPU; for the 5-question cap the wall-clock can
-# reach ~5 minutes. Default 300s gives comfortable headroom without
-# encouraging truly-hung requests to linger forever.
-_GRADING_MULTI_TIMEOUT_SECONDS = float(
-    os.getenv("GRADING_MULTI_TIMEOUT_SECONDS", "300")
 )
 
 # Safety cap on how many per-question grading passes a single request
@@ -127,37 +108,6 @@ _GRADING_MULTI_TIMEOUT_SECONDS = float(
 _MAX_QUESTIONS_PER_IMAGE = int(
     os.getenv("GRADING_MAX_QUESTIONS_PER_IMAGE", "5")
 )
-
-
-# --------------------------------------------------------------------- health route
-
-
-@router.get(
-    "/status",
-    summary="Grading service health: model load status and VRAM usage.",
-)
-async def grading_status() -> dict[str, object]:
-    """Return the current state of the grading model singleton.
-
-    Reports whether the model is loaded, the load-error message when it
-    is not, and VRAM utilisation so ops can detect memory pressure
-    without tailing log files.
-
-    This endpoint is wired to the grading router
-    (``/api/v1/grading/status``) and requires authentication
-    (``get_current_user`` on the router). It does NOT require
-    ``ROLE_INSTRUCTOR`` so any valid bearer token can call it.
-    """
-    from app.services.grading_service import _vram_used_mb  # local import to avoid cycle
-
-    ready = is_ready()
-    err = load_error()
-    return {
-        "model": "Qwen2.5-VL-7B-Instruct (bnb-4bit)",
-        "ready": ready,
-        "load_error": err,
-        "vram_used_mb": _vram_used_mb() if ready else 0,
-    }
 
 
 # --------------------------------------------------------------------- response model
@@ -185,11 +135,12 @@ class StepResult(BaseModel):
 
 
 class GradingResponse(BaseModel):
-    """JSON envelope returned by ``POST /api/v1/grading/submit``.
+    """Base grading envelope returned by the grading endpoints.
 
     The response is structured around the student's solution **steps** so
     frontends can highlight exactly which line went wrong, rather than
-    just surfacing a final score.
+    just surfacing a final score. The auto-detect endpoints extend this
+    shape with a ``match`` block (see :class:`GradingByImageResponse`).
     """
 
     student_score: int = Field(
@@ -237,9 +188,7 @@ class GradingResponse(BaseModel):
             "matched the expected final answer, so we awarded credit for "
             "the correct result despite per-step OCR uncertainty. "
             "Frontends should render a 'teacher review recommended' badge "
-            "when this is True. False on clean VLM output and on the "
-            "manual ``/submit`` path (which has no expected final answer "
-            "to compare against)."
+            "when this is True."
         ),
     )
 
@@ -295,133 +244,6 @@ def _validate_image(upload: UploadFile, data: bytes) -> None:
                 f"Received content-type={declared!r}."
             ),
         )
-
-
-# --------------------------------------------------------------------- endpoint
-
-
-@router.post(
-    "/submit",
-    response_model=GradingResponse,
-    summary="Auto-grade a student's handwritten answer image.",
-)
-async def submit_for_grading(
-    image: UploadFile = File(
-        ..., description="Student's handwritten answer (jpg/png/webp)."
-    ),
-    question: str = Form(..., description="The original question text."),
-    answer_key: str = Form(
-        ...,
-        description=(
-            "FULL worked solution (step-by-step), not just the final answer. "
-            'Example: "Step 1: ...  Step 2: ...  Step 3: final answer". '
-            "The grader scores each student step against this reference."
-        ),
-    ),
-    max_score: int = Form(10, ge=1, le=1000, description="Maximum score for this question."),
-    subject: str = Form("math", description="Subject hint used as grading context."),
-    user: CurrentUser = Depends(require_role("ROLE_INSTRUCTOR", "ROLE_ADMIN")),
-) -> GradingResponse:
-    """Grade one handwritten answer image with Qwen2.5-VL-7B-Instruct.
-
-    The image is read fully into memory (never persisted to disk),
-    validated, then handed to :func:`app.services.grading_service.grade_answer`
-    which runs the VLM in a thread-pool executor so the event loop stays
-    unblocked. The wall-clock timeout is controlled by
-    ``GRADING_TIMEOUT_SECONDS`` (default 120s) and maps to HTTP 504.
-
-    Unlike a plain final-answer check, this endpoint grades
-    **step-by-step**: the model transcribes every visible line from the
-    handwriting, matches each line against the worked solution in
-    ``answer_key``, and flags the first step that introduced an error.
-    Callers MUST therefore pass a complete worked solution - a single
-    final-answer string will yield poor partial-credit and weak
-    feedback. Example ``answer_key``::
-
-        Step 1: (2x^2 - xy + 3y^2) + (2x^2 + 2xy + y^2)
-        Step 2: Group like terms: (2x^2 + 2x^2) + (-xy + 2xy) + (3y^2 + y^2)
-        Step 3: = 4x^2 + xy + 4y^2
-    """
-    data = await image.read()
-    _validate_image(image, data)
-
-    logger.info(
-        "grading: user=%s submitting image bytes=%d subject=%s max_score=%d",
-        user.preferred_username or user.sub,
-        len(data),
-        subject,
-        max_score,
-    )
-
-    try:
-        result = await asyncio.wait_for(
-            grade_answer(
-                image_bytes=data,
-                question=question,
-                answer_key=answer_key,
-                max_score=max_score,
-                subject=subject,
-            ),
-            timeout=_GRADING_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "grading: user=%s request timed out after %.1fs",
-            user.preferred_username or user.sub,
-            _GRADING_TIMEOUT_SECONDS,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail=(
-                f"Grading exceeded the {_GRADING_TIMEOUT_SECONDS:.0f}s budget. "
-                "Try again with a smaller or clearer image."
-            ),
-        )
-    except GradingServiceUnavailable as exc:
-        logger.error("grading: service unavailable: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Grading service unavailable",
-        )
-    except GradingTimeout as exc:
-        logger.warning("grading: service-level timeout: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-            headers={"Retry-After": "30"},
-        )
-    except GradingBusy as exc:
-        logger.warning("grading: busy (GPU occupied): %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "Another grading request is currently running on the GPU. "
-                "Please retry in a few seconds."
-            ),
-            headers={"Retry-After": "10"},
-        )
-    except ValueError as exc:
-        # Raised by grading_service._decode_image on corrupt bytes.
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        )
-    except RuntimeError as exc:
-        # Most commonly CUDA OOM mid-generation. Treat as transient 503.
-        msg = str(exc).lower()
-        if "out of memory" in msg or "cuda" in msg:
-            logger.exception("grading: CUDA/runtime failure during generation")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Grading service unavailable",
-            )
-        logger.exception("grading: unexpected runtime error")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unexpected grading failure.",
-        )
-
-    return GradingResponse(**result)
 
 
 # ====================================================================== auto-detect endpoint
@@ -499,8 +321,8 @@ class NoMatchDetail(BaseModel):
     """Body of the HTTP 422 when the auto-detector cannot confidently match.
 
     The frontend should present the ``candidates`` list (if any) to the
-    student and let them pick, then re-submit via ``/submit`` (manual
-    override) with the chosen ``answer_key``.
+    student and surface the ambiguity so they can retry with a clearer
+    image or a legible question label.
     """
 
     reason: Literal["ambiguous_match", "no_question_identifier"] = Field(
@@ -555,11 +377,11 @@ async def submit_by_image(
        On low confidence this raises 422 with candidate alternatives.
     3. The full grading Qwen pass runs with the resolved item's
        ``problem_text`` / ``solution_steps`` / ``final_answer`` stitched
-       into an ``answer_key`` string, exactly as ``/submit`` does.
+       into an ``answer_key`` string.
 
-    Unlike ``/submit`` the client does not supply ``question`` or
-    ``answer_key`` - they're resolved server-side from ``file_id``
-    plus whatever the student wrote at the top of their page.
+    The client does not supply ``question`` or ``answer_key`` - they're
+    resolved server-side from ``file_id`` plus whatever the student
+    wrote at the top of their page.
     """
     data = await image.read()
     _validate_image(image, data)
@@ -815,9 +637,8 @@ class PerQuestionResult(BaseModel):
         default_factory=list,
         description=(
             "Top-K similarity candidates when ``status == 'ambiguous'``; "
-            "empty otherwise. Frontend should let the student pick one "
-            "and re-submit via ``/submit`` (manual override) or a future "
-            "``/submit-by-item`` endpoint."
+            "empty otherwise. Frontend should surface this list so the "
+            "student can retake the image with a clearer question label."
         ),
     )
 
