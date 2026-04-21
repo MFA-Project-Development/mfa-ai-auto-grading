@@ -46,6 +46,7 @@ from app.services.grading_service import (
     GradingBusy,
     GradingServiceUnavailable,
     grade_answer,
+    identify_all_questions,
     identify_question,
 )
 from app.services.question_resolver import (
@@ -105,6 +106,23 @@ _GRADING_TIMEOUT_SECONDS = float(os.getenv("GRADING_TIMEOUT_SECONDS", "120"))
 # being so long that stuck requests back up the executor pool.
 _GRADING_BY_IMAGE_TIMEOUT_SECONDS = float(
     os.getenv("GRADING_BY_IMAGE_TIMEOUT_SECONDS", "180")
+)
+
+# ``/submit-multi-by-image`` performs one identify pass plus one
+# grading pass PER detected question. Each grading pass can take
+# 30-60s on a cold GPU; for the 5-question cap the wall-clock can
+# reach ~5 minutes. Default 300s gives comfortable headroom without
+# encouraging truly-hung requests to linger forever.
+_GRADING_MULTI_TIMEOUT_SECONDS = float(
+    os.getenv("GRADING_MULTI_TIMEOUT_SECONDS", "300")
+)
+
+# Safety cap on how many per-question grading passes a single request
+# can trigger. Matches the grading_service cap on identify_all_questions.
+# Prevents a pathological page (or hallucinated question list) from
+# exhausting the GPU budget.
+_MAX_QUESTIONS_PER_IMAGE = int(
+    os.getenv("GRADING_MAX_QUESTIONS_PER_IMAGE", "5")
 )
 
 
@@ -175,6 +193,20 @@ class GradingResponse(BaseModel):
     )
     graded_by: str = Field(
         ..., description="Identifier of the model that produced this grade."
+    )
+    safety_net_engaged: bool = Field(
+        default=False,
+        description=(
+            "True when the final-answer safety net had to upgrade this "
+            "response to full marks - i.e. the VLM flagged one or more "
+            "intermediate steps but the student's last-line transcription "
+            "matched the expected final answer, so we awarded credit for "
+            "the correct result despite per-step OCR uncertainty. "
+            "Frontends should render a 'teacher review recommended' badge "
+            "when this is True. False on clean VLM output and on the "
+            "manual ``/submit`` path (which has no expected final answer "
+            "to compare against)."
+        ),
     )
 
 
@@ -676,3 +708,502 @@ async def submit_by_image(
     ).model_dump()
 
     return GradingByImageResponse(**grade_result)
+
+
+# ====================================================================== multi-question auto-detect endpoint
+
+
+class PerQuestionResult(BaseModel):
+    """One outcome entry inside a :class:`MultiGradingResponse`.
+
+    The ``status`` field tells the frontend how to render this row:
+
+    - ``"graded"``: ``grade`` is populated with a full
+      :class:`GradingByImageResponse`; ``error`` / ``candidates`` are
+      empty.
+    - ``"not_found"``: the student wrote a label but there was no
+      matching ``AnswerKeyItem`` in this ``file_id`` (and no semantic
+      fallback fired). ``grade`` is ``null``; ``error`` carries the
+      resolver message.
+    - ``"ambiguous"``: semantic resolver was inconclusive. ``grade``
+      is ``null``; ``candidates`` holds up to top-K alternatives the
+      user can pick from.
+    - ``"error"``: grading itself failed (timeout, GPU OOM, unexpected
+      exception). ``grade`` is ``null``; ``error`` carries a short
+      message.
+    """
+
+    detected_question_number: str = Field(
+        ...,
+        description=(
+            "Question label the identify pass read from the page, as "
+            "written by the student (may differ in format from the "
+            "canonical ``AnswerKeyItem.question_no``)."
+        ),
+    )
+    status: Literal["graded", "not_found", "ambiguous", "error"] = Field(
+        ..., description="Outcome for this specific question."
+    )
+    read_confidence: Literal["high", "medium", "low"] = Field(
+        default="low",
+        description="Identify pass's confidence that this label is legible.",
+    )
+    grade: GradingByImageResponse | None = Field(
+        default=None,
+        description="Full grading envelope when ``status == 'graded'``; null otherwise.",
+    )
+    error: str | None = Field(
+        default=None,
+        description="Human-readable explanation when ``status != 'graded'``.",
+    )
+    candidates: list[AmbiguousCandidate] = Field(
+        default_factory=list,
+        description=(
+            "Top-K similarity candidates when ``status == 'ambiguous'``; "
+            "empty otherwise. Frontend should let the student pick one "
+            "and re-submit via ``/submit`` (manual override) or a future "
+            "``/submit-by-item`` endpoint."
+        ),
+    )
+
+
+class MultiGradingResponse(BaseModel):
+    """Envelope returned by ``POST /api/v1/grading/submit-multi-by-image``.
+
+    Contains one :class:`PerQuestionResult` per question the identify
+    pass detected on the student's page, in top-to-bottom order.
+    """
+
+    file_id: str = Field(
+        ..., description="Echo of the request's ``file_id`` parameter."
+    )
+    total_detected: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "Number of distinct question labels the identify pass read "
+            "from the page (post-dedup, capped at "
+            "``GRADING_MAX_QUESTIONS_PER_IMAGE``)."
+        ),
+    )
+    total_graded: int = Field(
+        ..., ge=0, description="Number of ``results`` entries with ``status == 'graded'``."
+    )
+    total_failed: int = Field(
+        ..., ge=0, description="Number of ``results`` entries with ``status != 'graded'``."
+    )
+    results: list[PerQuestionResult] = Field(
+        default_factory=list,
+        description="One entry per detected question, in top-to-bottom order.",
+    )
+
+
+def _resolve_or_capture(
+    db: Session,
+    *,
+    file_uuid: uuid.UUID,
+    detection: dict[str, object],
+) -> tuple[object | None, PerQuestionResult | None]:
+    """Call ``resolve_question`` and translate exceptions to a result row.
+
+    Returns ``(match_result, None)`` on success, or
+    ``(None, PerQuestionResult)`` on a structured failure (the failure
+    row is ready to append to the response list).
+    """
+    qn = str(detection.get("question_number") or "")
+    rc_raw = str(detection.get("confidence") or "low")
+    rc: Literal["high", "medium", "low"] = (
+        rc_raw if rc_raw in {"high", "medium", "low"} else "low"  # type: ignore[assignment]
+    )
+
+    try:
+        match_result = resolve_question(
+            db=db,
+            file_id=file_uuid,
+            detected_number=qn or None,
+            detected_text=detection.get("problem_text_preview") or None,  # type: ignore[arg-type]
+            read_confidence=rc,
+        )
+        return match_result, None
+    except AmbiguousMatchError as exc:
+        candidates = [
+            AmbiguousCandidate(
+                item_id=c.item_id,
+                question_no=c.question_no,
+                problem_text=c.problem_text,
+                similarity_score=c.similarity_score,
+            )
+            for c in exc.candidates
+        ]
+        status_value: Literal["not_found", "ambiguous"] = (
+            "not_found" if exc.reason == "no_question_identifier" else "ambiguous"
+        )
+        return None, PerQuestionResult(
+            detected_question_number=qn,
+            status=status_value,
+            read_confidence=rc,
+            grade=None,
+            error=exc.message,
+            candidates=candidates,
+        )
+
+
+@router.post(
+    "/submit-multi-by-image",
+    response_model=MultiGradingResponse,
+    responses={422: {"model": NoMatchDetail}},
+    summary=(
+        "Auto-grade a page containing MULTIPLE student answers. Runs one "
+        "identify pass to list every question on the page, then grades "
+        "each one independently against the same ``file_id``."
+    ),
+)
+async def submit_multi_by_image(
+    image: UploadFile = File(
+        ..., description="Student's handwritten page with work for 1-5 questions."
+    ),
+    file_id: str = Form(
+        ...,
+        description=(
+            "UUID of the ``AnswerKeyFile`` all detected questions will "
+            "be graded against. Every detected question must belong to "
+            "this file."
+        ),
+    ),
+    max_score: int = Form(
+        10,
+        ge=1,
+        le=1000,
+        description=(
+            "Maximum score per question - applied uniformly to every "
+            "detected question. If questions in your exam have different "
+            "max scores, grade them one at a time via ``/submit-by-image``."
+        ),
+    ),
+    subject: str = Form("math", description="Subject hint used as grading context."),
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_role("ROLE_INSTRUCTOR", "ROLE_ADMIN")),
+) -> MultiGradingResponse:
+    """Grade every question the student answered on a single page.
+
+    Pipeline:
+
+    1. One short Qwen2.5-VL pass enumerates up to
+       ``GRADING_MAX_QUESTIONS_PER_IMAGE`` (default 5) distinct question
+       labels on the page.
+    2. For each detected label, resolve the matching ``AnswerKeyItem``
+       via :func:`~app.services.question_resolver.resolve_question`
+       (SQL-first, semantic fallback).
+    3. For each resolved item, run the full grading pass with
+       ``other_questions_on_page`` set so the VLM only grades this
+       question's lines and ignores the others.
+
+    Per-question failures (unresolved label, ambiguous match, grading
+    error) are reported inline in ``results[i].status`` instead of
+    failing the whole request. The overall endpoint only returns 422
+    when zero questions could be detected, or 422 / 504 when the
+    identify pass itself fails.
+    """
+    data = await image.read()
+    _validate_image(image, data)
+
+    try:
+        file_uuid = uuid.UUID(file_id)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid file_id: {file_id!r} is not a UUID.",
+        )
+
+    logger.info(
+        "grading-multi: user=%s file_id=%s bytes=%d subject=%s max_score=%d",
+        user.preferred_username or user.sub,
+        file_uuid,
+        len(data),
+        subject,
+        max_score,
+    )
+
+    # ---------------------------------------------------------------- stage 1: identify all
+    try:
+        detections = await asyncio.wait_for(
+            identify_all_questions(image_bytes=data),
+            timeout=_GRADING_BY_IMAGE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "grading-multi: identify_all timed out after %.1fs",
+            _GRADING_BY_IMAGE_TIMEOUT_SECONDS,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=(
+                f"Multi-question identification exceeded the "
+                f"{_GRADING_BY_IMAGE_TIMEOUT_SECONDS:.0f}s budget. Try "
+                "again with a smaller or clearer image."
+            ),
+        )
+    except GradingServiceUnavailable as exc:
+        logger.error("grading-multi: service unavailable (identify): %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Grading service unavailable",
+        )
+    except GradingBusy as exc:
+        logger.warning("grading-multi: busy at identify_all: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Another grading request is currently running on the GPU. "
+                "Please retry in a few seconds."
+            ),
+            headers={"Retry-After": "10"},
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    if not detections:
+        logger.info("grading-multi: no questions detected on page for file_id=%s", file_uuid)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason": "no_question_identifier",
+                "message": (
+                    "No question labels could be read from the page. "
+                    "Ensure the student wrote a clear question number "
+                    "(e.g. '0003.', 'Q3') at the top of each answer."
+                ),
+                "candidates": [],
+            },
+        )
+
+    # Hard cap even if the underlying service is misconfigured.
+    detections = detections[:_MAX_QUESTIONS_PER_IMAGE]
+    all_labels = [str(d.get("question_number") or "") for d in detections]
+    logger.info(
+        "grading-multi: detected %d question(s): %r",
+        len(detections),
+        all_labels,
+    )
+
+    # ---------------------------------------------------------------- stage 2: per-question resolve + grade
+    results: list[PerQuestionResult] = []
+
+    for idx, detection in enumerate(detections):
+        qn = str(detection.get("question_number") or "")
+        rc_raw = str(detection.get("confidence") or "low")
+        rc: Literal["high", "medium", "low"] = (
+            rc_raw if rc_raw in {"high", "medium", "low"} else "low"  # type: ignore[assignment]
+        )
+        others = [label for label in all_labels if label and label != qn]
+
+        logger.info(
+            "grading-multi: %d/%d resolving label=%r (others_on_page=%r)",
+            idx + 1, len(detections), qn, others,
+        )
+
+        # --- 2a: resolve -------------------------------------------
+        match_result, failure_row = _resolve_or_capture(
+            db, file_uuid=file_uuid, detection=detection
+        )
+        if failure_row is not None:
+            results.append(failure_row)
+            logger.info(
+                "grading-multi: %d/%d resolve failed status=%s reason=%r",
+                idx + 1, len(detections), failure_row.status, failure_row.error,
+            )
+            continue
+
+        assert match_result is not None  # mypy
+        question_text, answer_key_text = build_answer_key_from_item(match_result.item)
+        expected_final_answer = (
+            match_result.item.normalized_answer or match_result.item.final_answer
+        )
+
+        # --- 2b: grade ---------------------------------------------
+        try:
+            grade_result = await asyncio.wait_for(
+                grade_answer(
+                    image_bytes=data,
+                    question=question_text,
+                    answer_key=answer_key_text,
+                    max_score=max_score,
+                    subject=subject,
+                    question_label=match_result.item.question_no,
+                    expected_final_answer=expected_final_answer,
+                    other_questions_on_page=others,
+                ),
+                timeout=_GRADING_BY_IMAGE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "grading-multi: %d/%d grade timeout for label=%r",
+                idx + 1, len(detections), qn,
+            )
+            results.append(
+                PerQuestionResult(
+                    detected_question_number=qn,
+                    status="error",
+                    read_confidence=rc,
+                    grade=None,
+                    error=(
+                        f"Grading exceeded the "
+                        f"{_GRADING_BY_IMAGE_TIMEOUT_SECONDS:.0f}s budget."
+                    ),
+                )
+            )
+            continue
+        except GradingServiceUnavailable as exc:
+            # Model state is now bad for ALL remaining questions;
+            # record this one and bail out of the loop so the client
+            # sees the rest as untried rather than spuriously errored.
+            logger.error("grading-multi: service unavailable mid-loop: %s", exc)
+            results.append(
+                PerQuestionResult(
+                    detected_question_number=qn,
+                    status="error",
+                    read_confidence=rc,
+                    grade=None,
+                    error="Grading service unavailable",
+                )
+            )
+            break
+        except GradingBusy as exc:
+            logger.warning("grading-multi: busy on label=%r: %s", qn, exc)
+            results.append(
+                PerQuestionResult(
+                    detected_question_number=qn,
+                    status="error",
+                    read_confidence=rc,
+                    grade=None,
+                    error=(
+                        "GPU busy, this question was not graded. "
+                        "Retry this question individually."
+                    ),
+                )
+            )
+            continue
+        except ValueError as exc:
+            # Image decode issues should have been caught at stage 0;
+            # a ValueError here is exceptional.
+            logger.exception("grading-multi: unexpected ValueError for %r", qn)
+            results.append(
+                PerQuestionResult(
+                    detected_question_number=qn,
+                    status="error",
+                    read_confidence=rc,
+                    grade=None,
+                    error=str(exc),
+                )
+            )
+            continue
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "out of memory" in msg or "cuda" in msg:
+                logger.exception(
+                    "grading-multi: CUDA/runtime failure on label=%r", qn
+                )
+                results.append(
+                    PerQuestionResult(
+                        detected_question_number=qn,
+                        status="error",
+                        read_confidence=rc,
+                        grade=None,
+                        error="GPU out of memory",
+                    )
+                )
+                continue
+            logger.exception(
+                "grading-multi: unexpected runtime error on label=%r", qn
+            )
+            results.append(
+                PerQuestionResult(
+                    detected_question_number=qn,
+                    status="error",
+                    read_confidence=rc,
+                    grade=None,
+                    error="Unexpected grading failure",
+                )
+            )
+            continue
+
+        # --- 2c: attach match info + record success ---------------
+        grade_result["match"] = MatchInfo(
+            matched_item_id=str(match_result.item.id),
+            matched_question_no=match_result.item.question_no,
+            match_method=match_result.match_method,  # type: ignore[arg-type]
+            similarity_score=float(match_result.similarity_score),
+            read_confidence=match_result.read_confidence,  # type: ignore[arg-type]
+        ).model_dump()
+
+        try:
+            grade_obj = GradingByImageResponse(**grade_result)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception(
+                "grading-multi: response-model validation failed for label=%r", qn
+            )
+            results.append(
+                PerQuestionResult(
+                    detected_question_number=qn,
+                    status="error",
+                    read_confidence=rc,
+                    grade=None,
+                    error=f"Response validation failed: {exc}",
+                )
+            )
+            continue
+
+        results.append(
+            PerQuestionResult(
+                detected_question_number=qn,
+                status="graded",
+                read_confidence=rc,
+                grade=grade_obj,
+                error=None,
+            )
+        )
+        logger.info(
+            "grading-multi: %d/%d graded label=%r item=%s score=%d/%d",
+            idx + 1, len(detections), qn, match_result.item.id,
+            grade_obj.student_score, grade_obj.max_score,
+        )
+
+    total_graded = sum(1 for r in results if r.status == "graded")
+    total_failed = len(results) - total_graded
+
+    # Zero success -> 422 so the client gets a clear failure rather
+    # than a 200 full of errors.
+    if total_graded == 0:
+        logger.warning(
+            "grading-multi: all %d detected question(s) failed; returning 422",
+            len(detections),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason": "ambiguous_match",
+                "message": (
+                    "Detected questions on the page but none of them could "
+                    "be graded. Review ``results`` below for per-question "
+                    "reasons."
+                ),
+                "candidates": [],
+                "results": [r.model_dump() for r in results],
+            },
+        )
+
+    logger.info(
+        "grading-multi: file_id=%s done detected=%d graded=%d failed=%d",
+        file_uuid, len(detections), total_graded, total_failed,
+    )
+
+    return MultiGradingResponse(
+        file_id=str(file_uuid),
+        total_detected=len(detections),
+        total_graded=total_graded,
+        total_failed=total_failed,
+        results=results,
+    )

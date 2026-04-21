@@ -20,9 +20,13 @@ Architecture
   is the drop-in equivalent here. Weights land in VRAM at roughly
   ~5-6 GB (comparable to the AWQ build).
 - **Resolution cap**: the processor is pinned to the range
-  ``[256*28*28, 512*28*28]`` pixels (200,704 - 401,408). This single
+  ``[256*28*28, 1024*28*28]`` pixels (200,704 - 802,816). This single
   knob is the biggest lever on peak VRAM - a 12 MP phone photo would
   otherwise balloon the visual-token activations into the 6 GB range.
+  The upper bound was raised from ``512*28*28`` so that cursive
+  character pairs like ``+`` vs ``-`` and ``3`` vs ``8`` get enough
+  pixels to be disambiguated on legible handwriting (adds roughly
+  ~2 GB of activation headroom, still well under the 14 GB budget).
 - **Fragmentation mitigation**: ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``
   is set *before* torch is imported so the allocator can grow/shrink
   segments instead of fragmenting the reserved pool across requests.
@@ -74,8 +78,16 @@ MODEL_DISPLAY_NAME = "Qwen2.5-VL-7B-Instruct (bnb-4bit)"
 # Image-resolution bounds in pixels. Qwen2.5-VL tiles the image into
 # 28x28 patches; clamping both ends of the range keeps the visual
 # token sequence predictable and keeps activations in VRAM bounded.
-_MIN_PIXELS = 256 * 28 * 28  # 200,704 px  (~448x448 square equivalent)
-_MAX_PIXELS = 512 * 28 * 28  # 401,408 px  (~633x633 square equivalent)
+#
+# Upper bound was raised from 512*28*28 (401 k) to 1024*28*28 (802 k)
+# after we observed the 7B model confusing cursive ``+``/``-`` and
+# ``3``/``8`` on real student handwriting at the lower cap. The higher
+# cap roughly doubles the visual-token budget (~128 -> ~256 merged
+# tokens) which translates to +1-2 GB of activation memory during
+# inference - still well inside the 14 GB VRAM budget on the RTX 5080.
+# Override with env vars if you need to pin a different range.
+_MIN_PIXELS = int(os.getenv("GRADING_MIN_PIXELS", str(256 * 28 * 28)))  # 200,704
+_MAX_PIXELS = int(os.getenv("GRADING_MAX_PIXELS", str(1024 * 28 * 28)))  # 802,816
 
 # Max tokens the model may emit in a single pass. Enough headroom for
 # ~20 step JSON with prose feedback; override via env for edge cases.
@@ -778,7 +790,7 @@ def _repair_final_answer_match(
     max_score: int,
 ) -> None:
     """Safety net: if any extracted step matches the expected final answer,
-    upgrade the overall grading to full marks.
+    upgrade the **entire** response to full-marks / all-correct state.
 
     Rationale
     ---------
@@ -786,27 +798,37 @@ def _repair_final_answer_match(
     When the student writes the correct final answer on their paper,
     they have reached the correct result. Intermediate-step
     transcription noise (e.g. the VLM reads cursive "3" as "8") is the
-    grader's problem, not the student's - so a correct final answer
-    must win over flagged intermediate steps.
+    grader's problem, not the student's. A correct final answer is
+    strong evidence the student's math was valid; the per-step flags
+    the VLM produced against its own (noisy) transcription cannot be
+    trusted in that case.
+
+    We therefore normalise the **whole** response so no field
+    contradicts another:
+
+    - Top-level: ``student_score -> max_score``; ``is_correct -> True``;
+      ``method_correct -> True``.
+    - Per-step: every step with ``is_correct=false`` is flipped to
+      ``true`` and its ``error`` cleared. The original VLM verdicts
+      are logged at WARNING for audit.
+    - Derived text: ``first_error_step -> None``; ``error_summary -> None``;
+      ``feedback`` replaced with a single "full marks: final answer
+      matches" sentence (the original is logged).
+    - ``score_breakdown`` is left for ``_validate_score`` to recompute
+      from the now-all-correct step list (it will read ``N/N steps
+      correct``).
 
     We check **all** extracted steps (not just the last) because the
     VLM sometimes drops the trailing line or collapses it into the
     previous step; as long as the expected final answer appears
     somewhere in the student's transcribed work, credit it.
 
-    Mutations (all logged at WARNING for auditability):
-
-    - ``student_score`` bumped to ``max_score``.
-    - ``is_correct`` -> ``True``; ``method_correct`` -> ``True``.
-    - The step whose text matched is flipped to ``is_correct=True`` and
-      its ``error`` cleared.
-    - ``first_error_step`` is recomputed; set to ``None`` when every
-      step is now correct.
-
     No-op when:
 
     - ``expected_final_answer`` is falsy (manual ``/submit`` path).
-    - No extracted step matches the expected final answer.
+    - No extracted step matches the expected final answer. In that
+      case the per-step flags the VLM produced are preserved so the
+      caller sees genuine errors.
     """
     if not expected_final_answer:
         return
@@ -828,53 +850,92 @@ def _repair_final_answer_match(
             break
 
     if match_idx is None:
-        return  # student never wrote the expected final answer
+        return  # student never wrote the expected final answer; trust VLM flags.
 
     current_score = _clamp_score(data.get("student_score", 0), max_score)
     was_score = current_score
     was_is_correct = bool(data.get("is_correct"))
     was_method_correct = bool(data.get("method_correct"))
 
-    # Flip the matching step if it was flagged (rare but possible).
-    match_step = steps[match_idx]
-    if not match_step.get("is_correct", False):
-        logger.warning(
-            "grading: final-answer safety net flipping step %s is_correct "
-            "False -> True (text matches expected final answer %r)",
-            match_step.get("step_number"),
-            expected_final_answer,
-        )
-        match_step["is_correct"] = True
-        match_step["error"] = None
+    # --- Per-step: flip every flagged step to correct --------------------
+    # Rationale: since the final answer is right, any earlier step marked
+    # wrong by the VLM is almost certainly a transcription error on the
+    # VLM's side (cursive 3 vs 8 is the canonical case). Clearing those
+    # flags keeps the response internally consistent with the full-marks
+    # top-level verdict. If the math actually was wrong mid-way, the
+    # student wouldn't have reached the correct final answer.
+    flipped_audit: list[dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if not step.get("is_correct", False):
+            flipped_audit.append(
+                {
+                    "step_number": step.get("step_number"),
+                    "student_wrote": str(step.get("student_wrote") or "")[:200],
+                    "original_error": step.get("error"),
+                }
+            )
+            step["is_correct"] = True
+            step["error"] = None
 
-    # Upgrade top-level fields.
+    # --- Top-level scalars -----------------------------------------------
     data["student_score"] = max_score
     data["is_correct"] = True
     data["method_correct"] = True
+    # Flag the response so the UI / frontend can render a "auto-graded
+    # via final answer - please review intermediate work" badge. This
+    # is the explicit signal that we upgraded the score based on the
+    # final-line match rather than the VLM's per-step judgement.
+    data["safety_net_engaged"] = True
 
-    # Recompute first_error_step from the (possibly just-flipped) step
-    # list: the first still-incorrect step, or None when all correct.
-    new_first_err: int | None = None
-    for s in steps:
-        if isinstance(s, dict) and not s.get("is_correct", True):
-            try:
-                new_first_err = int(s.get("step_number"))
-            except (TypeError, ValueError):
-                new_first_err = None
-            break
-    data["first_error_step"] = new_first_err
+    # --- Derived text fields --------------------------------------------
+    # Everything is now correct -> no first_error_step, no error_summary.
+    data["first_error_step"] = None
 
+    original_summary = data.get("error_summary")
+    data["error_summary"] = None
+
+    # Preserve the original feedback in logs, replace the user-visible one
+    # with a clear single-sentence statement that will not contradict the
+    # top-level verdict.
+    original_feedback = str(data.get("feedback") or "").strip()
+    data["feedback"] = (
+        f"Full marks: the student reached the correct final answer "
+        f"({expected_final_answer}). Any intermediate-step uncertainty "
+        f"flagged during transcription was resolved in the student's "
+        f"favour because the final result is correct."
+    )
+
+    # --- Audit logging ---------------------------------------------------
     if was_score != max_score or not was_is_correct or not was_method_correct:
         logger.warning(
             "grading: final-answer safety net engaged - student reached the "
-            "correct final answer %r (matched in step %s); boosting "
+            "correct final answer %r (matched in step %s); "
             "score %d -> %d, is_correct %s -> True, method_correct %s -> True",
             expected_final_answer,
-            match_step.get("step_number"),
+            steps[match_idx].get("step_number"),
             was_score,
             max_score,
             was_is_correct,
             was_method_correct,
+        )
+    if flipped_audit:
+        logger.warning(
+            "grading: final-answer safety net also cleared %d intermediate "
+            "step flag(s) for consistency (likely VLM OCR noise). "
+            "original_flagged_steps=%r",
+            len(flipped_audit),
+            flipped_audit,
+        )
+    if original_summary or (
+        original_feedback and original_feedback != data["feedback"]
+    ):
+        logger.info(
+            "grading: final-answer safety net replaced error_summary=%r "
+            "feedback_head=%r",
+            original_summary,
+            original_feedback[:200] if original_feedback else None,
         )
 
 
@@ -1019,6 +1080,7 @@ def _build_messages(
     *,
     strict_retry: bool,
     question_label: str | None = None,
+    other_questions_on_page: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the Qwen2.5-VL chat-template messages for one grading call.
 
@@ -1033,17 +1095,65 @@ def _build_messages(
     exactly which string to treat as a question label and strip from
     the transcription. When omitted, the generic "strip any leading
     label" guidance still applies.
+
+    ``other_questions_on_page`` is the list of OTHER question labels
+    the student also wrote on the same page (populated by
+    ``/submit-multi-by-image``). When non-empty, the prompt gains a
+    second hint telling the VLM to restrict its transcription to
+    ``question_label``'s work only and IGNORE lines labelled with any
+    of the other numbers. Prevents cross-question contamination of
+    ``extracted_steps`` when one image carries multiple answers.
     """
-    label_hint = ""
+    # Build the context hint(s). Both notes share the same
+    # ``{label_hint}`` substitution point in the template so the
+    # prompt ordering is stable whether one or both are present.
+    hint_parts: list[str] = []
+
     if question_label and str(question_label).strip():
         clean = str(question_label).strip()
-        label_hint = (
+        hint_parts.append(
             f"Note: this paper is for question number \"{clean}\". "
             f"The student may write \"{clean}\", \"{clean}.\", \"Q{clean}\", "
             f"or similar as a label at the top of the page - that is a "
             f"question identifier, NOT part of the math expression. Strip "
-            f"it before comparing to the expected step 1.\n"
+            f"it before comparing to the expected step 1."
         )
+
+    if other_questions_on_page:
+        others_clean = [
+            str(q).strip()
+            for q in other_questions_on_page
+            if q is not None and str(q).strip()
+        ]
+        # De-dup and remove any that equal the target label.
+        target = (str(question_label).strip() if question_label else "").lower()
+        seen: set[str] = set()
+        others_unique: list[str] = []
+        for o in others_clean:
+            k = o.lower()
+            if k == target or k in seen:
+                continue
+            seen.add(k)
+            others_unique.append(o)
+
+        if others_unique:
+            others_display = ", ".join(f'"{o}"' for o in others_unique)
+            target_display = (
+                str(question_label).strip() if question_label else "the target question"
+            )
+            hint_parts.append(
+                f"Note: this page contains work for MULTIPLE questions. "
+                f"Only grade the work labelled with question number "
+                f"\"{target_display}\". IGNORE any lines labelled with "
+                f"{others_display} - those belong to OTHER questions. "
+                f"Those other-question lines MUST NOT appear in "
+                f"extracted_steps for this grading call, and they MUST "
+                f"NOT influence is_correct for \"{target_display}\"'s steps."
+            )
+
+    label_hint = "\n".join(hint_parts)
+    if label_hint:
+        label_hint = label_hint + "\n"
 
     user_prompt = _USER_PROMPT_TEMPLATE.format(
         question=question,
@@ -1165,6 +1275,7 @@ def _parse_failed_fallback(
         "confidence": "low",
         "score_breakdown": "0/0 steps correct",
         "graded_by": f"{MODEL_ID} (parse failed)",
+        "safety_net_engaged": False,
     }
 
 
@@ -1176,6 +1287,7 @@ def _grade_sync(
     subject: str,
     question_label: str | None = None,
     expected_final_answer: str | None = None,
+    other_questions_on_page: list[str] | None = None,
 ) -> dict[str, Any]:
     """Blocking implementation of :func:`grade_answer`.
 
@@ -1218,6 +1330,7 @@ def _grade_sync(
             pil_image, question, answer_key, max_score, subject,
             strict_retry=False,
             question_label=question_label,
+            other_questions_on_page=other_questions_on_page,
         )
         raw = _run_generation(messages)
 
@@ -1238,6 +1351,7 @@ def _grade_sync(
                 pil_image, question, answer_key, max_score, subject,
                 strict_retry=True,
                 question_label=question_label,
+                other_questions_on_page=other_questions_on_page,
             )
             raw = _run_generation(messages)
             try:
@@ -1308,6 +1422,12 @@ def _grade_sync(
             data.get("score_breakdown") or f"{correct_steps}/{total_steps} steps correct"
         ),
         "graded_by": MODEL_DISPLAY_NAME,
+        # True iff the final-answer safety net bumped this response to
+        # full marks by matching the last line against the expected
+        # final answer. Frontends should show a "teacher-review
+        # recommended" badge when this is True - the VLM's per-step
+        # flags are not fully trusted in that case.
+        "safety_net_engaged": bool(data.get("safety_net_engaged", False)),
     }
 
     logger.info(
@@ -1341,6 +1461,7 @@ async def grade_answer(
     subject: str = "math",
     question_label: str | None = None,
     expected_final_answer: str | None = None,
+    other_questions_on_page: list[str] | None = None,
 ) -> dict[str, Any]:
     """Grade a single handwritten answer image.
 
@@ -1387,6 +1508,14 @@ async def grade_answer(
         to full marks regardless of intermediate-step transcription
         noise. Protects against VLM OCR errors on cursive digits
         (3 vs 8, 1 vs 7, ...) in intermediate lines.
+    other_questions_on_page:
+        List of OTHER question labels present on the same page -
+        populated by ``/submit-multi-by-image`` so the grading prompt
+        can tell the VLM to grade only this question's work and ignore
+        lines labelled with the other numbers. Prevents cross-question
+        contamination of ``extracted_steps`` when one image carries
+        multiple student answers. Omit (or pass ``None`` / empty list)
+        for single-question grading.
 
     Returns
     -------
@@ -1418,6 +1547,7 @@ async def grade_answer(
         subject,
         question_label,
         expected_final_answer,
+        other_questions_on_page,
     )
 
 
@@ -1570,6 +1700,216 @@ async def identify_question(image_bytes: bytes) -> dict[str, Any]:
     """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _identify_sync, image_bytes)
+
+
+# --------------------------------------------------------------------- multi-question identification
+# Sibling of :func:`identify_question` for the multi-question endpoint
+# (``/submit-multi-by-image``). Instead of reading just the top of the
+# page and returning ONE label, it scans the whole page and returns a
+# list of distinct question labels (up to MAX) the student wrote.
+#
+# We run this as a single Qwen pass (still cheap - ~256 tokens) rather
+# than N independent "is question X here?" calls. The returned list
+# then drives the per-question grade loop in the route layer.
+
+_IDENTIFY_ALL_SYSTEM_PROMPT = (
+    "You are scanning a handwritten page to list which questions the "
+    "student answered. Do NOT grade. Do NOT solve."
+)
+
+_IDENTIFY_ALL_USER_PROMPT = """Scan this handwritten page for QUESTION LABELS.
+
+A question label is a number or short identifier at the start of a
+distinct section of student work, for example: "1.", "Q3", "0002.",
+"Question 5:", "(3)".
+
+Return ONE entry per distinct question the student answered on this
+page. Return at most 5 entries. Order entries top-to-bottom as they
+appear on the page. Do NOT return the same question twice. Do NOT
+include printed headers or answer-key labels - only include labels
+the student wrote in their own handwriting.
+
+For each entry, include:
+- question_number: the label as written, digits only if it is numeric
+  (e.g. "0002", "3", "Q5"). Do NOT include the trailing "." or ")".
+- problem_text_preview: up to 60 characters of the first line the
+  student wrote for this question - the starting expression they
+  copied from the exam. If the student did NOT copy the problem
+  statement (started straight with working), set this to null.
+- confidence: "high" | "medium" | "low" for how clearly you can see
+  this label on the page.
+
+OUTPUT RULES:
+- Output RAW JSON only
+- No prose, no markdown fences, no ```json
+- Start your response with { and end with }
+- Shape: {"questions": [{"question_number": "...", "problem_text_preview": "..." or null, "confidence": "..."}, ...]}
+
+Example valid output:
+{"questions": [
+  {"question_number": "0002", "problem_text_preview": "Simplify (x+2)^2", "confidence": "high"},
+  {"question_number": "0003", "problem_text_preview": "(3x^2+2xy-y^2)-(x^2-5xy-4y^2)", "confidence": "high"}
+]}"""
+
+# Tighter than the grading pass (1024) but looser than single identify
+# (128) because multi-question can emit up to 5 entries.
+_IDENTIFY_ALL_MAX_NEW_TOKENS = int(
+    os.getenv("GRADING_IDENTIFY_ALL_MAX_NEW_TOKENS", "256")
+)
+
+# Hard cap on entries we process downstream even if the model emits
+# more. Prevents pathological pages from triggering 10+ grading passes.
+_IDENTIFY_ALL_MAX_RESULTS = int(
+    os.getenv("GRADING_MAX_QUESTIONS_PER_IMAGE", "5")
+)
+
+
+def _sanitize_identification_entry(raw: Any, fallback_idx: int) -> dict[str, Any] | None:
+    """Coerce one model-output entry into ``{question_number, problem_text_preview, confidence}``.
+
+    Returns ``None`` for entries that are clearly bogus (no usable
+    question number). Never raises.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    qn = _coerce_optional_str(raw.get("question_number"))
+    if qn is None:
+        return None
+    # Models sometimes emit the trailing "." / ")" - strip once more.
+    qn = qn.strip().rstrip(".").rstrip(")").strip()
+    if not qn:
+        return None
+
+    preview = _coerce_optional_str(raw.get("problem_text_preview"))
+    if preview is not None:
+        preview = preview[:200]  # hard cap even if model ignored the 60-char hint
+
+    conf = _normalize_confidence(raw.get("confidence"))
+
+    return {
+        "question_number": qn,
+        "problem_text_preview": preview,
+        "confidence": conf,
+    }
+
+
+def _identify_all_sync(image_bytes: bytes) -> list[dict[str, Any]]:
+    """Blocking implementation of :func:`identify_all_questions`.
+
+    Returns a list (possibly empty) of identification entries. Dedups
+    by ``question_number`` keeping first occurrence (preserves
+    top-to-bottom order). Caps at ``_IDENTIFY_ALL_MAX_RESULTS`` entries.
+
+    Like :func:`_identify_sync` we swallow JSON parse failures rather
+    than raising: the route layer can still 422 with "no questions
+    detected" and let the client retry manually.
+    """
+    if not is_ready():
+        raise GradingServiceUnavailable(
+            "Grading model is not loaded (see startup logs for details)."
+        )
+
+    pil_image = _decode_image(image_bytes)
+
+    if not _generate_lock.acquire(blocking=False):
+        raise GradingBusy(
+            "A previous grading request is still running on the GPU; "
+            "retry shortly."
+        )
+
+    t_start = time.perf_counter()
+    try:
+        messages = [
+            {"role": "system", "content": _IDENTIFY_ALL_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_image},
+                    {"type": "text", "text": _IDENTIFY_ALL_USER_PROMPT},
+                ],
+            },
+        ]
+        raw = _run_generation(
+            messages, max_new_tokens=_IDENTIFY_ALL_MAX_NEW_TOKENS
+        )
+    finally:
+        _generate_lock.release()
+
+    elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+
+    try:
+        data = _parse_json_response(raw)
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "identify_all: JSON parse failed (%s); returning empty list. "
+            "raw head=%r",
+            exc,
+            raw[:200],
+        )
+        return []
+
+    raw_entries = data.get("questions")
+    if not isinstance(raw_entries, list):
+        logger.warning(
+            "identify_all: 'questions' field missing or wrong type; "
+            "returning empty list. data=%r",
+            dict(list(data.items())[:3]),
+        )
+        return []
+
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for idx, entry in enumerate(raw_entries):
+        sanitized = _sanitize_identification_entry(entry, idx)
+        if sanitized is None:
+            continue
+        key = sanitized["question_number"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(sanitized)
+        if len(out) >= _IDENTIFY_ALL_MAX_RESULTS:
+            break
+
+    logger.info(
+        "identify_all: detected=%d (cap=%d) elapsed_ms=%.1f vram_used_mb=%d "
+        "labels=%r",
+        len(out),
+        _IDENTIFY_ALL_MAX_RESULTS,
+        elapsed_ms,
+        _vram_used_mb(),
+        [e["question_number"] for e in out],
+    )
+    return out
+
+
+async def identify_all_questions(image_bytes: bytes) -> list[dict[str, Any]]:
+    """List every distinct question the student answered on the page.
+
+    Async wrapper around :func:`_identify_all_sync`. Dispatches onto
+    the default executor so the FastAPI event loop stays responsive
+    during the ~3-5s Qwen pass.
+
+    Returns
+    -------
+    list of dict
+        Each entry has keys ``question_number`` (non-empty str),
+        ``problem_text_preview`` (str | None), and ``confidence``
+        (``"high" | "medium" | "low"``). Empty list when the model
+        couldn't find any labels OR when JSON parsing failed.
+
+    Raises
+    ------
+    GradingServiceUnavailable
+        Model failed to load at startup.
+    GradingBusy
+        Another grading request is holding the GPU.
+    ValueError
+        ``image_bytes`` could not be decoded.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _identify_all_sync, image_bytes)
 
 
 # --------------------------------------------------------------------- eager load
