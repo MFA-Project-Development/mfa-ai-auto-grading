@@ -171,6 +171,22 @@ async def validate_token(token: str) -> dict[str, Any]:
     return claims
 
 
+async def get_bearer_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> str:
+    """FastAPI dependency returning the raw bearer token string.
+
+    Unlike :func:`get_current_user` this dependency does **not** decode
+    the token - it only checks the ``Authorization`` header shape. Use
+    it when you need to forward the caller's token to an upstream
+    service that shares the same Keycloak realm, while still relying on
+    ``get_current_user`` (applied at the router level) to validate it.
+    """
+    if credentials is None or (credentials.scheme or "").lower() != "bearer":
+        raise _unauthorized("Missing or invalid Authorization header.")
+    return credentials.credentials
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> CurrentUser:

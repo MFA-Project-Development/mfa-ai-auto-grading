@@ -4,14 +4,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
+from app.api.routes.assessment import router as assessment_router
 from app.api.routes.auth import router as auth_router
 from app.api.routes.delete import router as delete_router
 from app.api.routes.detail import router as detail_router
 from app.api.routes.grading import router as grading_router
+from app.api.routes.grading_pipeline import router as grading_pipeline_router
 from app.api.routes.upload import router as upload_router
 from app.core.config import settings
 from app.core.security import get_current_user, init_jwks_cache
 from app.db.session import init_db
+from app.services.assessment_client import get_assessment_client
 from app.services.ocr_service import get_ocr_status, log_ocr_status
 from app.services.storage import StorageError, get_storage_service
 
@@ -77,6 +80,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # ------------------------------------------------------------------ shutdown
+    # Close the shared assessment-API client so httpx can release its
+    # connection pool cleanly on --reload and graceful shutdown.
+    try:
+        await get_assessment_client().aclose()
+    except Exception:  # pragma: no cover - best-effort cleanup
+        logger.exception("shutdown: assessment-client close failed")
+
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 
@@ -93,6 +104,13 @@ app.include_router(delete_router, dependencies=_auth_required)
 # Grading endpoints further restrict access to ROLE_INSTRUCTOR / ROLE_ADMIN
 # via ``Depends(require_role(...))`` declared on each route handler.
 app.include_router(grading_router, dependencies=_auth_required)
+# Assessment-API passthroughs reuse the caller's Keycloak token when
+# calling the upstream service.
+app.include_router(assessment_router, dependencies=_auth_required)
+# End-to-end auto-grading pipeline: chains the upstream passthroughs
+# together with the local VLM grading engine. Role check
+# (ROLE_INSTRUCTOR / ROLE_ADMIN) lives on the route handler.
+app.include_router(grading_pipeline_router, dependencies=_auth_required)
 
 
 @app.get("/", dependencies=_auth_required)

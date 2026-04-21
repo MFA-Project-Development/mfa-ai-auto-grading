@@ -77,6 +77,34 @@ class Settings(BaseSettings):
     # configurable lets multiple environments share a bucket.
     minio_object_prefix: str = Field(default="answer-keys", alias="MINIO_OBJECT_PREFIX")
 
+    # ------------------------------------------------------------------ assessment API
+    # Default base URL used by ``app.services.assessment_client``.
+    # Individual call sites may still pass their own base URL when they
+    # target a different upstream.
+    assessment_api_base_url: str = Field(
+        default="https://phase-one-api.dara-it.site/api/v1/",
+        alias="ASSESSMENT_API_BASE_URL",
+    )
+    # Optional static API key injected as ``Authorization: Bearer <key>``
+    # (or ``X-API-Key`` - see :class:`AssessmentAPIClient`). Leave empty
+    # to disable auth. Never hardcode - always source from env.
+    assessment_api_key: str = Field(default="", alias="ASSESSMENT_API_KEY")
+    # Header scheme used when ``assessment_api_key`` is set. ``bearer``
+    # sends ``Authorization: Bearer <key>``; ``x-api-key`` sends
+    # ``X-API-Key: <key>``; ``none`` disables auth even if a key is set.
+    assessment_api_auth_scheme: str = Field(
+        default="bearer", alias="ASSESSMENT_API_AUTH_SCHEME"
+    )
+    assessment_api_timeout_seconds: float = Field(
+        default=10.0, alias="ASSESSMENT_API_TIMEOUT_SECONDS"
+    )
+    assessment_api_max_retries: int = Field(
+        default=3, alias="ASSESSMENT_API_MAX_RETRIES"
+    )
+    assessment_api_backoff_seconds: float = Field(
+        default=0.5, alias="ASSESSMENT_API_BACKOFF_SECONDS"
+    )
+
     # ------------------------------------------------------------------ Keycloak / OIDC
     # The API acts as an OAuth2 resource server: it does not issue tokens,
     # it only validates bearer JWTs minted by Keycloak. All values below
