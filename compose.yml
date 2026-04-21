@@ -52,15 +52,20 @@ services:
       - minio_data:/data
     networks:
       - mfa-network
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   minio-init:
     image: minio/mc:latest
     container_name: mfa-minio-init
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      sleep 8;
       mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
       mc mb local/${MINIO_BUCKET} || true;
       mc anonymous set private local/${MINIO_BUCKET};
@@ -69,10 +74,79 @@ services:
     networks:
       - mfa-network
 
+  # -------------------------------------------------------------------------
+  # FastAPI application.
+  #
+  # The container talks to Postgres / MinIO using their compose service
+  # names, so we override the *_HOST / *_ENDPOINT vars from .env (which
+  # point at localhost for local dev).
+  #
+  # GPU note: to run the VLM on an NVIDIA GPU, (a) build the image with
+  # --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128,
+  # (b) install the NVIDIA Container Toolkit on the host, and (c)
+  # uncomment the `deploy.resources.reservations.devices` block below.
+  # -------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: mfa-auto-grading:latest
+    container_name: mfa-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override the localhost-centric values from .env so the app can
+      # reach sibling containers on the compose network.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      MINIO_ENDPOINT: minio:9000
+      # Presigned URLs still need a browser-reachable endpoint. By default
+      # we advertise the host port MinIO is published on.
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-localhost:${MINIO_API_PORT:-9000}}
+      MINIO_SECURE: "false"
+      # Alembic runs on startup via docker-entrypoint.sh; AUTO_CREATE_DB
+      # is the FastAPI lifespan fallback and stays off in production.
+      AUTO_CREATE_DB: "0"
+      RUN_MIGRATIONS: "1"
+      WAIT_FOR_DB: "1"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      # Persist the ChromaDB vector store across container restarts.
+      - chroma_data:/app/chroma_db
+      # Cache downloaded HuggingFace / Torch / Paddle models so a
+      # redeploy doesn't re-download multi-GB weights.
+      - model_cache:/app/.cache
+      # Optional local upload fallback (used only when STORAGE_DIR is set).
+      - uploads_data:/app/uploads
+    networks:
+      - mfa-network
+    # Uncomment to expose the host NVIDIA GPU to the VLM.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
 volumes:
   postgres_data:
   pgadmin_data:
   minio_data:
+  chroma_data:
+  model_cache:
+  uploads_data:
 
 networks:
   mfa-network:

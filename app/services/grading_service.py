@@ -1682,9 +1682,7 @@ def _run_generation(
 # --------------------------------------------------------------------- orchestration
 
 
-def _parse_failed_fallback(
-    raw: str, max_score: int, original_bytes_len: int
-) -> dict[str, Any]:
+def _parse_failed_fallback(raw: str, max_score: int) -> dict[str, Any]:
     """Build a safe zero-score envelope when both parse attempts failed.
 
     The route layer still gets a valid :class:`GradingResponse`-shaped
@@ -1698,9 +1696,6 @@ def _parse_failed_fallback(
         Raw model output that could not be parsed.
     max_score:
         Maximum score (echoed in the response).
-    original_bytes_len:
-        Length of the original image bytes (unused but kept for future
-        audit logging).
 
     Returns
     -------
@@ -1882,7 +1877,7 @@ def _grade_sync(
     inference_ms = (time.perf_counter() - t_start) * 1000.0
 
     if data is None:
-        result = _parse_failed_fallback(raw, max_score, len(image_bytes))
+        result = _parse_failed_fallback(raw, max_score)
         logger.info(
             "grading: image_size_bytes=%d pixels=%d output_len=%d parse_success=%s "
             "retried=%s boost=%s correct=0/%d score=0/%d confidence=low "
@@ -2371,7 +2366,7 @@ _IDENTIFY_ALL_MAX_RESULTS: int = int(
 )
 
 
-def _sanitize_identification_entry(raw: Any, fallback_idx: int) -> dict[str, Any] | None:
+def _sanitize_identification_entry(raw: Any) -> dict[str, Any] | None:
     """Coerce one model-output entry into ``{question_number, problem_text_preview, confidence}``.
 
     Returns ``None`` for entries that are clearly bogus (no usable
@@ -2381,8 +2376,6 @@ def _sanitize_identification_entry(raw: Any, fallback_idx: int) -> dict[str, Any
     ----------
     raw:
         Raw entry dict from the model output.
-    fallback_idx:
-        Fallback index for error messages (unused in output).
 
     Returns
     -------
@@ -2498,8 +2491,8 @@ def _identify_all_sync(image_bytes: bytes) -> list[dict[str, Any]]:
 
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
-    for idx, entry in enumerate(raw_entries):
-        sanitized = _sanitize_identification_entry(entry, idx)
+    for entry in raw_entries:
+        sanitized = _sanitize_identification_entry(entry)
         if sanitized is None:
             continue
         key = sanitized["question_number"].lower()

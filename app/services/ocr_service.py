@@ -9,9 +9,6 @@ Provides a small, testable surface that the rest of the pipeline can call:
 * :func:`postprocess_ocr_text` - math/noise normalization layered on top of
   ``normalize_ocr_text`` to turn raw PaddleOCR strings into parser-friendly
   text (e.g. ``a+b`` -> ``a + b``, ``--`` -> ``-``).
-* :func:`choose_best_text` - decide whether to keep native PDF text or a page's
-  OCR output, based on a cheap readability score. Prevents OCR from degrading
-  already-good native extraction.
 * :func:`is_ocr_available` - lets callers degrade gracefully when the engine
   is not installed.
 
@@ -61,10 +58,6 @@ _MATH_SYMBOL_REPLACEMENTS: dict[str, str] = {
 # not mangle unary minus (``-5``), signed exponents (``1e-3``) or parenthesised
 # negatives (``(-x)``). ``\w`` in Python matches Korean characters too.
 _OPERATOR_SPACING_RE = re.compile(r"(?<=[\w\)])([+\-*/=])(?=[\w\(])")
-
-# Characters considered "meaningful" when scoring how readable a string is.
-# Covers ASCII letters/digits and the Hangul syllables block.
-_READABLE_CHAR_RE = re.compile(r"[A-Za-z0-9\uac00-\ud7a3]")
 
 
 @lru_cache(maxsize=4)
@@ -295,51 +288,6 @@ def postprocess_ocr_text(text: str) -> str:
     # Keep paragraph breaks but kill >2 consecutive blank lines.
     result = re.sub(r"\n{3,}", "\n\n", result)
     return result.strip()
-
-
-def readability_score(text: str) -> float:
-    """Return the fraction of ``text`` made up of letters / digits / Hangul.
-
-    Used by :func:`choose_best_text` to compare native vs OCR quality. A page
-    full of ``?`` or box-drawing garbage scores near 0; a clean paragraph
-    typically scores above ~0.75.
-    """
-    stripped = (text or "").strip()
-    if not stripped:
-        return 0.0
-    valid = len(_READABLE_CHAR_RE.findall(stripped))
-    return valid / len(stripped)
-
-
-def choose_best_text(native: str, ocr: str) -> str:
-    """Return whichever of ``native`` / ``ocr`` is more readable.
-
-    Rules:
-        * empty OCR  -> keep native
-        * empty native -> use OCR
-        * otherwise pick the one with the higher :func:`readability_score`;
-          native wins ties so we never replace good native text with comparable
-          OCR output.
-
-    This is the safe default for the PDF pipeline: callers who also need to
-    know *which* source won (for logging / metrics) can call
-    :func:`readability_score` directly or use the ``source``-returning helper
-    in :mod:`app.services.pdf_service`.
-    """
-    native = native or ""
-    ocr = ocr or ""
-
-    if not ocr.strip():
-        return native
-    if not native.strip():
-        return ocr
-
-    native_score = readability_score(native)
-    ocr_score = readability_score(ocr)
-
-    if ocr_score > native_score:
-        return ocr
-    return native
 
 
 def _decode_image_to_numpy(image_bytes: bytes):

@@ -136,28 +136,10 @@ class AnswerKeyFileRepository:
         self.db.flush()
         return record
 
-    def clear_storage_metadata(self, record: AnswerKeyFile) -> AnswerKeyFile:
-        """Wipe object-storage fields (used after a MinIO delete)."""
-        record.storage_provider = None
-        record.bucket_name = None
-        record.object_name = None
-        record.stored_file_name = None
-        record.object_etag = None
-        self.db.flush()
-        return record
-
     def set_error(self, record: AnswerKeyFile, message: str) -> AnswerKeyFile:
         """Convenience for the failure path: mark failed + persist message."""
         record.ingestion_status = IngestionStatus.FAILED.value
         record.error_message = message
-        self.db.flush()
-        return record
-
-    def update_fields(self, record: AnswerKeyFile, **fields: Any) -> AnswerKeyFile:
-        """Bulk field setter. Unknown attributes are ignored on purpose."""
-        for key, value in fields.items():
-            if hasattr(record, key):
-                setattr(record, key, value)
         self.db.flush()
         return record
 

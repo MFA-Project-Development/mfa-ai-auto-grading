@@ -26,7 +26,6 @@ import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from minio import Minio
 from minio.error import S3Error
@@ -38,9 +37,6 @@ from app.services.storage.exceptions import (
     StorageDownloadError,
     StorageUploadError,
 )
-
-if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -196,61 +192,6 @@ class MinioStorageService:
             size=size,
             content_type=content_type,
         )
-
-    # ================================================================== download
-    def download_file(self, object_name: str) -> bytes:
-        """Return the object bytes. Used by reprocessing / retries.
-
-        Raises:
-            StorageDownloadError: when the object is missing or the GET
-                fails.
-        """
-        response = None
-        try:
-            response = self.client.get_object(self.bucket_name, object_name)
-            return response.read()
-        except S3Error as exc:
-            raise StorageDownloadError(
-                f"MinIO download failed object={object_name!r}: {exc}"
-            ) from exc
-        except Exception as exc:
-            raise StorageDownloadError(
-                f"MinIO download error object={object_name!r}: {exc}"
-            ) from exc
-        finally:
-            if response is not None:
-                try:
-                    response.close()
-                    response.release_conn()
-                except Exception:  # pragma: no cover - best effort cleanup
-                    pass
-
-    def stream_file(self, object_name: str, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
-        """Stream an object back in chunks. Use for large files.
-
-        The caller is responsible for fully consuming the iterator so the
-        underlying HTTP connection is released. Wrap in ``contextlib.closing``
-        if you need guaranteed cleanup.
-        """
-        try:
-            response = self.client.get_object(self.bucket_name, object_name)
-        except S3Error as exc:
-            raise StorageDownloadError(
-                f"MinIO stream failed object={object_name!r}: {exc}"
-            ) from exc
-
-        try:
-            while True:
-                chunk = response.read(chunk_size)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            try:
-                response.close()
-                response.release_conn()
-            except Exception:  # pragma: no cover
-                pass
 
     # ================================================================== delete
     def delete_object(self, object_name: str) -> bool:

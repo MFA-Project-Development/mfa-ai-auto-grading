@@ -154,11 +154,6 @@ def normalize_answer_text(raw: str | None) -> str | None:
     return text or None
 
 
-def normalize_expression(raw: str | None) -> str | None:
-    """Alias of :func:`normalize_answer_text` kept for readability at call sites."""
-    return normalize_answer_text(raw)
-
-
 # ---------------------------------------------------------------------- internals
 def _rewrite_superscript(match: re.Match[str]) -> str:
     base = match.group("base")

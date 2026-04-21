@@ -271,7 +271,6 @@ async def _grade_paper(
     *,
     db: Session,
     file_id: uuid.UUID,
-    paper: dict[str, Any],
     image_bytes: bytes,
     max_points_by_qno: dict[str, int],
 ) -> list[GradedQuestionTrace]:
@@ -664,7 +663,6 @@ async def _run(
         traces = await _grade_paper(
             db=db,
             file_id=payload.file_id,
-            paper=papers[paper_results.index(result)],
             image_bytes=image_bytes,
             max_points_by_qno=max_points_by_qno,
         )

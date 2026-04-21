@@ -7,7 +7,6 @@ cascade-friendly deletion scoped to a single file.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -80,47 +79,6 @@ class AnswerKeyItemRepository:
         self.db.flush()
         return record
 
-    def bulk_create(self, items: Iterable[dict[str, Any]]) -> list[AnswerKeyItem]:
-        """Insert many rows at once.
-
-        ``items`` is an iterable of kwargs matching :meth:`create`. Each
-        row is flushed in a single batch. The returned list preserves the
-        input order so callers can correlate results with their own input
-        (e.g. for setting vector ids after Chroma writes).
-        """
-        records: list[AnswerKeyItem] = []
-        for payload in items:
-            payload = dict(payload)
-            payload.setdefault("id", uuid.uuid4())
-            chunk_type = payload.pop("chunk_type", ChunkType.QUESTION)
-            record = AnswerKeyItem(
-                id=payload["id"],
-                file_id=payload["file_id"],
-                question_no=payload["question_no"],
-                heading_text=payload.get("heading_text"),
-                chapter=payload.get("chapter"),
-                content=payload["content"],
-                answer_text=payload.get("answer_text"),
-                page_start=payload.get("page_start"),
-                page_end=payload.get("page_end"),
-                page_numbers=payload.get("page_numbers"),
-                parser_used=payload.get("parser_used"),
-                chunk_type=_as_value(chunk_type),
-                vector_id=payload.get("vector_id"),
-                problem_text=payload.get("problem_text"),
-                solution_steps_json=_clean_list(payload.get("solution_steps")),
-                final_answer=payload.get("final_answer"),
-                normalized_answer=payload.get("normalized_answer"),
-                answer_type=payload.get("answer_type"),
-                formula_list_json=_clean_list(payload.get("formula_list")),
-            )
-            self.db.add(record)
-            records.append(record)
-
-        if records:
-            self.db.flush()
-        return records
-
     # ------------------------------------------------------------------ read
     def get(self, item_id: uuid.UUID | str) -> AnswerKeyItem | None:
         return self.db.get(AnswerKeyItem, _as_uuid(item_id))
@@ -155,12 +113,6 @@ class AnswerKeyItemRepository:
             AnswerKeyItem.question_no == question_no,
         )
         return self.db.scalars(stmt).first()
-
-    # ------------------------------------------------------------------ update
-    def set_vector_id(self, record: AnswerKeyItem, vector_id: str) -> AnswerKeyItem:
-        record.vector_id = vector_id
-        self.db.flush()
-        return record
 
     # ------------------------------------------------------------------ delete
     def delete(self, record: AnswerKeyItem) -> None:

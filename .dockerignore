@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------------
+# Build context filter for the MFA auto-grading service.
+# Keep this in sync with .gitignore but prefer stricter rules: we want the
+# image to contain nothing beyond what the service actually needs at runtime.
+# ---------------------------------------------------------------------------
+
+# VCS & IDE metadata
+.git
+.gitignore
+.gitattributes
+.github
+.vscode
+.idea
+*.swp
+
+# Python bytecode / caches
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info
+
+# Virtualenvs (we build our own inside the image)
+venv
+.venv
+env
+ENV
+
+# Secrets & local env files - inject via `env_file` / `-e` at runtime
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Logs & runtime artifacts
+*.log
+logs
+*.pid
+*.pid.lock
+
+# Local uploads / storage fallbacks
+uploads
+storage
+
+# Vector store & SQLite artifacts (regenerated per-deployment)
+chroma_db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.db
+
+# ML model binaries - mount as volume, don't bake into the image
+models
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# HuggingFace / Torch / PaddleOCR caches
+.cache
+.huggingface
+.paddleocr
+
+# Test & coverage artifacts
+tests
+.pytest_cache
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
+
+# Linters & type checkers
+.mypy_cache
+.ruff_cache
+.pyre
+.pytype
+
+# Jupyter
+.ipynb_checkpoints
+
+# Docker meta (don't ship compose into the image)
+compose.yml
+compose.override.yml
+docker-compose.override.yml
+Dockerfile
+.dockerignore
+
+# OS junk
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Root-level docs that aren't needed at runtime
+README.md

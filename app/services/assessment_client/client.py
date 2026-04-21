@@ -268,7 +268,6 @@ class AssessmentAPIClient:
         merged_headers = dict(headers) if headers else None
 
         attempt = 0
-        last_exc: Exception | None = None
         while True:
             attempt += 1
             try:
@@ -281,7 +280,6 @@ class AssessmentAPIClient:
                     **extra,
                 )
             except httpx.TimeoutException as exc:
-                last_exc = exc
                 if self._should_retry(attempt):
                     await self._sleep_backoff(attempt)
                     continue
@@ -289,7 +287,6 @@ class AssessmentAPIClient:
                     f"{method} {path} timed out after {self._timeout}s"
                 ) from exc
             except httpx.RequestError as exc:
-                last_exc = exc
                 if self._should_retry(attempt):
                     await self._sleep_backoff(attempt)
                     continue
@@ -315,12 +312,6 @@ class AssessmentAPIClient:
                 raise self._status_error(response)
 
             return response
-
-        # Unreachable - the loop above always returns or raises, but
-        # keep the compiler/type-checker happy.
-        raise AssessmentAPIRequestError(  # pragma: no cover
-            f"{method} {path} exhausted retries"
-        ) from last_exc
 
     async def _request_json(
         self,
