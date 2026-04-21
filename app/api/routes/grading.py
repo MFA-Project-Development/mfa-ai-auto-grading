@@ -45,9 +45,12 @@ from app.db.session import get_db
 from app.services.grading_service import (
     GradingBusy,
     GradingServiceUnavailable,
+    GradingTimeout,
     grade_answer,
     identify_all_questions,
     identify_question,
+    is_ready,
+    load_error,
 )
 from app.services.question_resolver import (
     AmbiguousMatchError,
@@ -124,6 +127,37 @@ _GRADING_MULTI_TIMEOUT_SECONDS = float(
 _MAX_QUESTIONS_PER_IMAGE = int(
     os.getenv("GRADING_MAX_QUESTIONS_PER_IMAGE", "5")
 )
+
+
+# --------------------------------------------------------------------- health route
+
+
+@router.get(
+    "/status",
+    summary="Grading service health: model load status and VRAM usage.",
+)
+async def grading_status() -> dict[str, object]:
+    """Return the current state of the grading model singleton.
+
+    Reports whether the model is loaded, the load-error message when it
+    is not, and VRAM utilisation so ops can detect memory pressure
+    without tailing log files.
+
+    This endpoint is wired to the grading router
+    (``/api/v1/grading/status``) and requires authentication
+    (``get_current_user`` on the router). It does NOT require
+    ``ROLE_INSTRUCTOR`` so any valid bearer token can call it.
+    """
+    from app.services.grading_service import _vram_used_mb  # local import to avoid cycle
+
+    ready = is_ready()
+    err = load_error()
+    return {
+        "model": "Qwen2.5-VL-7B-Instruct (bnb-4bit)",
+        "ready": ready,
+        "load_error": err,
+        "vram_used_mb": _vram_used_mb() if ready else 0,
+    }
 
 
 # --------------------------------------------------------------------- response model
@@ -349,6 +383,13 @@ async def submit_for_grading(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Grading service unavailable",
         )
+    except GradingTimeout as exc:
+        logger.warning("grading: service-level timeout: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "30"},
+        )
     except GradingBusy as exc:
         logger.warning("grading: busy (GPU occupied): %s", exc)
         raise HTTPException(
@@ -558,6 +599,13 @@ async def submit_by_image(
                 "budget. Try again with a smaller or clearer image."
             ),
         )
+    except GradingTimeout as exc:
+        logger.warning("grading-by-image: service-level timeout (identify): %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "30"},
+        )
     except GradingServiceUnavailable as exc:
         logger.error("grading-by-image: service unavailable (identify): %s", exc)
         raise HTTPException(
@@ -663,6 +711,13 @@ async def submit_by_image(
                 f"Grading exceeded the {_GRADING_BY_IMAGE_TIMEOUT_SECONDS:.0f}s budget. "
                 "Try again with a smaller or clearer image."
             ),
+        )
+    except GradingTimeout as exc:
+        logger.warning("grading-by-image: service-level timeout (grade): %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "30"},
         )
     except GradingServiceUnavailable as exc:
         logger.error("grading-by-image: service unavailable (grade): %s", exc)
@@ -942,6 +997,13 @@ async def submit_multi_by_image(
                 f"{_GRADING_BY_IMAGE_TIMEOUT_SECONDS:.0f}s budget. Try "
                 "again with a smaller or clearer image."
             ),
+        )
+    except GradingTimeout as exc:
+        logger.warning("grading-multi: service-level timeout (identify_all): %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "30"},
         )
     except GradingServiceUnavailable as exc:
         logger.error("grading-multi: service unavailable (identify): %s", exc)

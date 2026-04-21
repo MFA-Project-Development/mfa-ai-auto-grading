@@ -72,8 +72,8 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------- constants
 
-MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
-MODEL_DISPLAY_NAME = "Qwen2.5-VL-7B-Instruct (bnb-4bit)"
+MODEL_ID: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+MODEL_DISPLAY_NAME: str = "Qwen2.5-VL-7B-Instruct (bnb-4bit)"
 
 # Image-resolution bounds in pixels. Qwen2.5-VL tiles the image into
 # 28x28 patches; clamping both ends of the range keeps the visual
@@ -86,12 +86,29 @@ MODEL_DISPLAY_NAME = "Qwen2.5-VL-7B-Instruct (bnb-4bit)"
 # tokens) which translates to +1-2 GB of activation memory during
 # inference - still well inside the 14 GB VRAM budget on the RTX 5080.
 # Override with env vars if you need to pin a different range.
-_MIN_PIXELS = int(os.getenv("GRADING_MIN_PIXELS", str(256 * 28 * 28)))  # 200,704
-_MAX_PIXELS = int(os.getenv("GRADING_MAX_PIXELS", str(1024 * 28 * 28)))  # 802,816
+_MIN_PIXELS: int = int(os.getenv("GRADING_MIN_PIXELS", str(256 * 28 * 28)))   # 200,704
+_MAX_PIXELS: int = int(os.getenv("GRADING_MAX_PIXELS", str(1024 * 28 * 28)))  # 802,816
 
 # Max tokens the model may emit in a single pass. Enough headroom for
 # ~20 step JSON with prose feedback; override via env for edge cases.
-_MAX_NEW_TOKENS_PASS = int(os.getenv("GRADING_MAX_NEW_TOKENS", "1024"))
+_MAX_NEW_TOKENS_PASS: int = int(os.getenv("GRADING_MAX_NEW_TOKENS", "1024"))
+
+# Wall-clock budget (in seconds) for a single run_in_executor grading call.
+# When exceeded the async wrapper raises GradingTimeout so the route layer
+# can return 503 + Retry-After instead of blocking the executor pool.
+# Override via GRADING_TIMEOUT_S env var. The route layer adds its own
+# (typically larger) asyncio.wait_for budget on top of this.
+_GRADING_TIMEOUT_S: float = float(os.getenv("GRADING_TIMEOUT_S", "120"))
+
+# Maximum pixel budget used during a low-confidence resolution retry.
+# Roughly 4× the default cap (4096 tile slots vs 1024). Override via
+# GRADING_MAX_PIXELS_RETRY env var if you hit VRAM limits on retry.
+_MAX_PIXELS_RETRY: int = int(os.getenv("GRADING_MAX_PIXELS_RETRY", str(2048 * 28 * 28)))
+
+# Set GRADING_PREPROCESS_IMAGES=0 to skip opencv preprocessing entirely
+# (useful for already-clean digital scans where denoising/deskewing is
+# a no-op at best or harmful at worst). Defaults to enabled.
+_GRADING_PREPROCESS: bool = os.getenv("GRADING_PREPROCESS_IMAGES", "1") == "1"
 
 
 # --------------------------------------------------------------------- exceptions
@@ -117,9 +134,67 @@ class GradingBusy(RuntimeError):
     """
 
 
+class GradingTimeout(RuntimeError):
+    """Raised when a grading call exceeds ``_GRADING_TIMEOUT_S``.
+
+    The blocking ``model.generate`` call in the executor thread cannot
+    be cancelled once started, but we can surface a meaningful 503 to
+    the caller instead of letting the request hang indefinitely.
+    The route layer should translate this into HTTP 503 + Retry-After.
+    """
+
+
+# --------------------------------------------------------------------- OCR rule constants
+# These are injected into the user prompt (via string concatenation in
+# _USER_PROMPT_TEMPLATE) so each rule block can be tuned independently
+# without touching the surrounding template. The template calls .format()
+# on the concatenated result, so any literal curly braces here must be
+# doubled ({{ / }}).
+
+_SYMBOL_RULES: str = """\
+CRITICAL SYMBOL READING RULES:
+- Carefully distinguish: 3 vs 8, 1 vs 7, 0 vs 6, 4 vs 9
+- Carefully distinguish: + vs t, - vs em-dash, × vs x (variable)
+- Carefully distinguish: y vs q vs g, n vs u, a vs d, z vs 2
+- When a character is ambiguous choose the reading that makes \
+the transformation follow LOGICALLY from the previous step
+- Superscripts: x² → x^2, x³ → x^3 (always use ^ notation)
+- Greek: α→alpha, β→beta, π→pi, Σ→sum, Δ→delta"""
+
+_STRUCTURE_RULES: str = """\
+MATH STRUCTURE ENCODING:
+- Fraction: (x+1) over (x-2) → (x+1)/(x-2)
+- Exponent: x squared → x^2
+- Square root: root of (x+1) → sqrt(x+1)
+- Subscript: x sub 1 → x_1
+- Absolute value: |x+1| → |x+1|
+- Integral: ∫x dx → integral(x)dx
+- Always preserve all parentheses present in original writing
+- Mixed number: 2½ → 2 + 1/2"""
+
+_LAYOUT_RULES: str = """\
+LAYOUT READING RULES:
+- If a math expression continues on the next physical line \
+(indented or aligned) treat it as ONE step, not two
+- Vertical addition/subtraction column layouts → single expression
+- Ignore ruled lines, margin borders, printed page decorations
+- Student work flows strictly top-to-bottom; read in that order
+- A line that is only '=' followed by a result is still its own \
+step — do not merge it with the preceding line"""
+
+_COUNT_VERIFICATION: str = """\
+LINE-COUNT VERIFICATION (do this BEFORE outputting JSON):
+1. Count every visible '=' sign on the page → call this E
+2. Count every distinct horizontal line of math → call this L
+3. Your extracted_steps list MUST contain AT LEAST max(E,L) entries
+4. The LAST line the student wrote MUST be the final entry
+5. If your entry count is less than E or L, re-read the image \
+and add the missing lines before producing JSON"""
+
+
 # --------------------------------------------------------------------- prompt
 
-_SYSTEM_PROMPT = (
+_SYSTEM_PROMPT: str = (
     "You are a math teacher grading a handwritten student solution. "
     "You will READ the handwriting AND verify the math in ONE response."
 )
@@ -130,7 +205,15 @@ _SYSTEM_PROMPT = (
 # filled by ``_build_messages`` - either an empty string or a line
 # telling the model the exact question-number label to strip (we know
 # it when the request came through ``/submit-by-image``).
-_USER_PROMPT_TEMPLATE = """Grade this handwritten math solution.
+#
+# The OCR rule constants (_SYMBOL_RULES, _STRUCTURE_RULES, _LAYOUT_RULES,
+# _COUNT_VERIFICATION) are concatenated as separate module-level strings
+# so each block can be tuned independently. They are inserted between the
+# {label_hint} substitution point and STEP 1 to ensure the model applies
+# them during the reading phase.
+_USER_PROMPT_TEMPLATE: str = (
+    """\
+Grade this handwritten math solution.
 
 Question: {question}
 Full correct solution (answer key):
@@ -138,6 +221,16 @@ Full correct solution (answer key):
 Maximum score: {max_score}
 Subject: {subject}
 {label_hint}
+"""
+    + _SYMBOL_RULES
+    + "\n\n"
+    + _STRUCTURE_RULES
+    + "\n\n"
+    + _LAYOUT_RULES
+    + "\n\n"
+    + _COUNT_VERIFICATION
+    + """
+
 STEP 1 - READ the handwriting and TRANSCRIBE the math:
 For EACH line of mathematical working the student wrote, emit ONE
 entry in ``extracted_steps`` with its ``student_wrote`` field set
@@ -151,13 +244,13 @@ at least that many step entries plus one for the starting expression.
 
 CRITICAL - Question labels are NOT math. Strip them before writing
 ``student_wrote``:
-Question labels like "1.", "Q3", "0003.", "Question 5:", "(3)" at
+Question labels like "1.", "Q3", "<label>.", "Question 5:", "(3)" at
 the very start of the page are METADATA. They MUST NOT appear in
 ``student_wrote``. A label's presence is NEVER grounds for
 ``is_correct: false`` - strip it, then compare.
 
 Example - this is the exact failure mode to avoid:
-  Page starts with:  "0003. (3x^2+2xy-y^2)-(x^2-5xy-4y^2)"
+  Page starts with:  "<label>. (3x^2+2xy-y^2)-(x^2-5xy-4y^2)"
 
   CORRECT output:
     {{"step_number": 1,
@@ -167,7 +260,7 @@ Example - this is the exact failure mode to avoid:
 
   WRONG output (do NOT produce this):
     {{"step_number": 1,
-      "student_wrote": "0003. (3x^2+2xy-y^2)-(x^2-5xy-4y^2)",
+      "student_wrote": "<label>. (3x^2+2xy-y^2)-(x^2-5xy-4y^2)",
       "is_correct": false,
       "error": "includes question label"}}
 
@@ -183,7 +276,7 @@ answer there unless this IS the final-answer step.
 
 CRITICAL VERIFICATION RULES:
 - Rule 0: Strip question labels before comparing. A leading "Q3.",
-  "0003.", "(3)", "Question 5:" at the top of the student's page is
+  "<label>.", "(3)", "Question 5:" at the top of the student's page is
   a question NUMBER, not a coefficient or part of the math. Never
   flag it as a coefficient mismatch against the expected expression.
 - Rule 1: After stripping the label, step 1 must show the EXACT
@@ -244,13 +337,22 @@ OUTPUT RULES (strictly follow):
   "is_correct": false,
   "confidence": "high"
 }}"""
+)
 
 # Appended to the user prompt on a retry when the first response was
 # not parseable. Intentionally short and blunt.
-_STRICT_RETRY_SUFFIX = (
+_STRICT_RETRY_SUFFIX: str = (
     "\n\nIMPORTANT: Your previous response could not be parsed.\n"
     "Output ONLY a valid JSON object. Start with { end with }.\n"
     "No other text."
+)
+
+# Required top-level keys in a grading JSON response. Checked after
+# json.loads in _parse_json_response when called from _grade_sync.
+# Identification responses (identify_question / identify_all_questions)
+# do NOT pass this set, so they are not validated against it.
+_GRADING_REQUIRED_FIELDS: frozenset[str] = frozenset(
+    {"extracted_steps", "student_score", "is_correct"}
 )
 
 
@@ -262,12 +364,17 @@ _STRICT_RETRY_SUFFIX = (
 _model: Any = None
 _processor: Any = None
 _device: str | None = None
-_load_lock = threading.Lock()
-_load_attempted = False
+_load_lock: threading.Lock = threading.Lock()
+_load_attempted: bool = False
+# Human-readable description of the last model-load failure, or None
+# when load succeeded (or has not been attempted yet). Exposed via
+# load_error() so health-check routes can surface this without tailing
+# log files.
+_load_error: str | None = None
 # Serialises GPU access across request threads dispatched by the
 # FastAPI executor pool. Non-blocking acquire in ``_grade_sync`` so we
 # can surface 503/GradingBusy instead of queueing up blocked threads.
-_generate_lock = threading.Lock()
+_generate_lock: threading.Lock = threading.Lock()
 
 
 # --------------------------------------------------------------------- VRAM helpers
@@ -328,7 +435,8 @@ def _load_model() -> None:
 
     Idempotent and thread-safe: concurrent first-touch callers share
     one load attempt via :data:`_load_lock`. On failure the singletons
-    stay ``None`` and :func:`grade_answer` raises
+    stay ``None``, :data:`_load_error` is populated with a human-readable
+    description, and :func:`grade_answer` raises
     :class:`GradingServiceUnavailable`.
 
     The processor is pinned to ``[_MIN_PIXELS, _MAX_PIXELS]`` so every
@@ -336,7 +444,7 @@ def _load_model() -> None:
     reaches the visual encoder - this is the single largest knob for
     per-request VRAM usage.
     """
-    global _model, _processor, _device, _load_attempted
+    global _model, _processor, _device, _load_attempted, _load_error
 
     with _load_lock:
         if _load_attempted:
@@ -350,13 +458,18 @@ def _load_model() -> None:
                 BitsAndBytesConfig,
                 Qwen2_5_VLForConditionalGeneration,
             )
-        except Exception:
+        except Exception as exc:
+            _load_error = f"transformers/torch not installed: {exc}"
             logger.exception(
                 "grading: transformers/torch not installed; grading endpoint will 503"
             )
             return
 
         if not torch.cuda.is_available():
+            _load_error = (
+                "CUDA is not available on this host; "
+                "Qwen2.5-VL bnb-4bit requires a GPU."
+            )
             logger.error(
                 "grading: CUDA is not available on this host; "
                 "Qwen2.5-VL bnb-4bit requires a GPU. Grading endpoint will 503."
@@ -365,7 +478,8 @@ def _load_model() -> None:
 
         try:
             import bitsandbytes  # noqa: F401
-        except Exception:
+        except Exception as exc:
+            _load_error = f"bitsandbytes not installed: {exc}"
             logger.exception(
                 "grading: bitsandbytes not installed; "
                 "grading endpoint will 503. Install via `pip install bitsandbytes`."
@@ -412,6 +526,7 @@ def _load_model() -> None:
             _log_vram_usage("after-load")
         except Exception as exc:
             if _is_oom(exc):
+                _load_error = f"CUDA OOM loading {MODEL_ID}: {exc}"
                 logger.error(
                     "grading: CUDA OOM loading %s even in AWQ/fp16 form. "
                     "Grading endpoint will 503. (%s)",
@@ -419,12 +534,14 @@ def _load_model() -> None:
                     exc,
                 )
             else:
+                _load_error = f"Load failed for {MODEL_ID}: {exc}"
                 logger.exception(
                     "grading: load failed for %s; grading endpoint will 503",
                     MODEL_ID,
                 )
             _model = None
             _processor = None
+            _device = None
             try:
                 torch.cuda.empty_cache()
             except Exception:  # pragma: no cover - best-effort cleanup
@@ -436,15 +553,133 @@ def is_ready() -> bool:
     return _model is not None and _processor is not None
 
 
+def load_error() -> str | None:
+    """Return the human-readable model-load failure message, or ``None``.
+
+    Returns ``None`` when the model loaded successfully (or when a load
+    has not been attempted yet). Returns a non-empty string on any
+    failure path so health-check routes can surface the reason without
+    tailing log files.
+
+    Returns
+    -------
+    str | None
+        Load failure description, or ``None`` on success / not-yet-attempted.
+    """
+    return _load_error
+
+
 # --------------------------------------------------------------------- image helpers
 
 
+def _preprocess_image(pil_image: Image.Image) -> Image.Image:
+    """Apply opencv-based preprocessing to improve handwriting OCR accuracy.
+
+    Pipeline (when ``GRADING_PREPROCESS_IMAGES=1`` and opencv is installed):
+
+    1. Convert to grayscale.
+    2. :func:`cv2.fastNlMeansDenoising` (h=10) to reduce scan/JPEG noise.
+    3. Deskew: find the dominant tilt angle of dark pixels via
+       :func:`cv2.minAreaRect` and correct with :func:`cv2.warpAffine`
+       when ``0.5° < |angle| < 45°``.
+    4. :func:`cv2.adaptiveThreshold` (ADAPTIVE_THRESH_GAUSSIAN_C,
+       blockSize=31, C=10) to binarise the image.
+    5. Convert back to RGB PIL ``Image``.
+
+    If ``opencv-python`` (cv2) or ``numpy`` is not installed, or if
+    ``GRADING_PREPROCESS_IMAGES`` is set to ``"0"``, the original image
+    is returned unchanged so the function is always safe to call.
+
+    Parameters
+    ----------
+    pil_image:
+        Input image in any PIL mode.
+
+    Returns
+    -------
+    Image.Image
+        Preprocessed RGB image, or the original on any error / missing deps.
+    """
+    if not _GRADING_PREPROCESS:
+        return pil_image
+
+    try:
+        import cv2  # type: ignore[import]
+        import numpy as np
+    except ImportError:
+        return pil_image
+
+    try:
+        # 1. Grayscale
+        gray = np.array(pil_image.convert("L"))
+
+        # 2. Denoise
+        denoised = cv2.fastNlMeansDenoising(gray, h=10)
+
+        # 3. Deskew using minimum area rectangle of dark pixels
+        rows, cols = np.where(denoised < 128)
+        if len(rows) >= 4:
+            pts = np.column_stack([cols, rows]).astype(np.float32)
+            rect = cv2.minAreaRect(pts)
+            angle: float = float(rect[-1])
+            # Normalize: minAreaRect returns angles in (-90, 0]; map to (-45, 45]
+            if angle < -45.0:
+                angle += 90.0
+            if abs(angle) > 0.5 and abs(angle) < 45.0:
+                h_img, w_img = denoised.shape[:2]
+                M = cv2.getRotationMatrix2D(
+                    (w_img / 2.0, h_img / 2.0), angle, 1.0
+                )
+                denoised = cv2.warpAffine(
+                    denoised,
+                    M,
+                    (w_img, h_img),
+                    flags=cv2.INTER_CUBIC,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+
+        # 4. Adaptive threshold (binarise)
+        thresh = cv2.adaptiveThreshold(
+            denoised,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            10,
+        )
+
+        # 5. Back to RGB PIL
+        rgb = cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
+        return Image.fromarray(rgb)
+
+    except Exception as exc:  # pragma: no cover - best-effort preprocessing
+        logger.warning("grading: image preprocessing failed, using original: %s", exc)
+        return pil_image
+
+
 def _decode_image(image_bytes: bytes) -> Image.Image:
-    """Decode raw bytes into a PIL ``RGB`` image.
+    """Decode raw bytes into a preprocessed PIL ``RGB`` image.
+
+    Responsibilities:
+
+    1. Decode ``image_bytes`` → PIL :class:`~PIL.Image.Image`.
+    2. Convert to ``RGB`` mode.
+    3. Apply :func:`_preprocess_image` (grayscale → denoise → deskew →
+       binarise) to improve downstream OCR accuracy.
 
     We do **not** resize here - the processor applies its own
     ``[_MIN_PIXELS, _MAX_PIXELS]`` smart-resize downstream, which is
     what the visual encoder is trained against.
+
+    Parameters
+    ----------
+    image_bytes:
+        Raw encoded image data (JPEG, PNG, WebP, …).
+
+    Returns
+    -------
+    Image.Image
+        Preprocessed RGB image ready to pass to the model processor.
 
     Raises
     ------
@@ -459,7 +694,7 @@ def _decode_image(image_bytes: bytes) -> Image.Image:
         raise ValueError(f"Could not decode image: {exc}") from exc
     if img.mode != "RGB":
         img = img.convert("RGB")
-    return img
+    return _preprocess_image(img)
 
 
 def _estimate_pixels_after_resize(image: Image.Image) -> int:
@@ -468,6 +703,16 @@ def _estimate_pixels_after_resize(image: Image.Image) -> int:
     Uses Qwen's own ``smart_resize`` helper when available so the
     number reported matches what the model sees. Falls back to the
     original image dimensions if the helper cannot be imported.
+
+    Parameters
+    ----------
+    image:
+        PIL image whose dimensions are used for the estimate.
+
+    Returns
+    -------
+    int
+        Estimated pixel count after processor smart-resize.
     """
     try:  # pragma: no cover - depends on qwen_vl_utils internals
         from qwen_vl_utils.vision_process import smart_resize  # type: ignore
@@ -486,7 +731,10 @@ def _estimate_pixels_after_resize(image: Image.Image) -> int:
 # --------------------------------------------------------------------- parsing
 
 
-def _parse_json_response(raw: str) -> dict[str, Any]:
+def _parse_json_response(
+    raw: str,
+    required_fields: frozenset[str] | None = None,
+) -> dict[str, Any]:
     """Turn the model's raw output into a validated dict.
 
     Defensive against three common failure modes:
@@ -501,10 +749,27 @@ def _parse_json_response(raw: str) -> dict[str, Any]:
        triple-backticks inside ``feedback`` and replace it with the
        model's own ``error_summary`` (or a generic pointer).
 
+    Parameters
+    ----------
+    raw:
+        Raw string output from the model.
+    required_fields:
+        When provided, every key in this set must be present in the
+        parsed dict. If any are missing a ``ValueError`` is raised
+        listing the absent keys. Pass ``_GRADING_REQUIRED_FIELDS`` from
+        grading call sites; omit (or pass ``None``) for identification
+        calls whose response schema differs.
+
+    Returns
+    -------
+    dict[str, Any]
+        Parsed and minimally validated response dictionary.
+
     Raises
     ------
     ValueError
-        If no balanced ``{...}`` can be located in ``raw``.
+        If no balanced ``{...}`` can be located in ``raw``, or if
+        ``required_fields`` are absent from the parsed dict.
     json.JSONDecodeError
         If the isolated span is not valid JSON.
     """
@@ -527,7 +792,15 @@ def _parse_json_response(raw: str) -> dict[str, Any]:
             f"Top-level JSON value is {type(data).__name__}, expected object."
         )
 
-    # 4. detect the "model nested its JSON inside feedback" failure mode
+    # 4. required-field validation (grading responses only)
+    if required_fields:
+        missing = required_fields - data.keys()
+        if missing:
+            raise ValueError(
+                f"Model response missing required fields: {sorted(missing)}"
+            )
+
+    # 5. detect the "model nested its JSON inside feedback" failure mode
     feedback = data.get("feedback", "")
     if isinstance(feedback, str):
         stripped = feedback.strip()
@@ -574,14 +847,24 @@ def _label_prefix_variants(label: str) -> list[str]:
     We try these in order of *longest first* when stripping so the most
     specific form wins (e.g. we prefer to strip ``"0003."`` over
     ``"0003"`` alone, to avoid leaving a stray ``"."``).
+
+    Parameters
+    ----------
+    label:
+        Canonical question label, e.g. ``"0003"`` or ``"5"``.
+
+    Returns
+    -------
+    list[str]
+        Deduplicated list of label variants sorted longest-first.
     """
     clean = str(label or "").strip()
     if not clean:
         return []
 
     variants: list[str] = []
-    # Canonical and punctuation variants.
-    for suffix in ("", ".", ")", ":", " -", " -"):
+    # Canonical and punctuation variants (no duplicate suffixes).
+    for suffix in ("", ".", ")", ":", " -"):
         variants.append(f"{clean}{suffix}")
         variants.append(f"Q{clean}{suffix}")
         variants.append(f"({clean}){suffix}".rstrip())
@@ -623,8 +906,18 @@ def _strip_leading_label(text: str, variants: list[str]) -> str:
     ``"3x^2 + 4"`` (variant ``"3"`` would match the leading coefficient)
     or ``"3.141"`` (variant ``"3."`` would match the integer part).
 
-    Returns the original ``text`` unchanged if no variant matched
-    under those constraints.
+    Parameters
+    ----------
+    text:
+        The ``student_wrote`` string to strip.
+    variants:
+        Label variants to attempt, produced by :func:`_label_prefix_variants`.
+
+    Returns
+    -------
+    str
+        ``text`` with the leading label removed, or ``text`` unchanged
+        when no safe match was found.
     """
     if not text:
         return text
@@ -660,7 +953,7 @@ def _strip_leading_label(text: str, variants: list[str]) -> str:
     return text
 
 
-_MATH_WHITESPACE_RE = re.compile(r"\s+")
+_MATH_WHITESPACE_RE: re.Pattern[str] = re.compile(r"\s+")
 
 
 def _math_normalize(text: str) -> str:
@@ -693,6 +986,13 @@ def _repair_question_label_in_step1(
 
     All mutations are logged at WARNING level so we can audit how often
     the model needs bailing out.
+
+    Parameters
+    ----------
+    data:
+        Parsed grading response dict, mutated in place.
+    question_label:
+        Canonical question label (e.g. ``"0003"``) when known, else ``None``.
     """
     if not question_label:
         return
@@ -750,7 +1050,7 @@ def _repair_question_label_in_step1(
         if (
             "label" in err_summary
             or "question number" in err_summary
-            or "0003" in err_summary  # defensive against the exact failure mode
+            or "0003" in err_summary  # legacy: defensive against historical model output
             or question_label.lower() in err_summary
         ):
             data["error_summary"] = (
@@ -765,6 +1065,16 @@ def _normalize_final_answer(text: Any) -> str:
     common Korean / English answer-prefix tokens (``"답"``, ``"ans"``,
     ``"Answer:"``), whitespace, and lower-cases. Returns the
     comparison key, not a user-facing string.
+
+    Parameters
+    ----------
+    text:
+        Raw answer string to normalise.
+
+    Returns
+    -------
+    str
+        Comparison key suitable for equality testing.
     """
     s = str(text or "").strip()
     if not s:
@@ -829,6 +1139,15 @@ def _repair_final_answer_match(
     - No extracted step matches the expected final answer. In that
       case the per-step flags the VLM produced are preserved so the
       caller sees genuine errors.
+
+    Parameters
+    ----------
+    data:
+        Parsed grading response dict, mutated in place.
+    expected_final_answer:
+        Expected final answer string (e.g. ``"2x^2 + xy + 4y^2"``).
+    max_score:
+        Maximum score for score clamping.
     """
     if not expected_final_answer:
         return
@@ -946,15 +1265,27 @@ def _validate_score(data: dict[str, Any], max_score: int) -> dict[str, Any]:
 
     - ``student_score`` is clamped to ``[0, max_score]``.
     - If the model returned ``student_score=0`` but ``extracted_steps``
-      shows any correct steps, we override the score with a
-      step-proportional estimate and log a WARNING so the drift is
-      auditable.
+      shows a **majority** of steps correct (step_ratio >= 0.5), we
+      override with a step-proportional estimate and log a WARNING. We
+      require step_ratio >= 0.5 to avoid awarding partial credit when
+      the student merely copied the opening expression correctly while
+      getting every subsequent step wrong.
     - ``first_error_step`` is back-filled from the first incorrect step
       when the model forgot to emit it.
     - ``score_breakdown`` is populated with ``"X/Y steps correct"`` so
       the response model always has a value.
 
-    Returns the mutated ``data`` dict for chained-call convenience.
+    Parameters
+    ----------
+    data:
+        Parsed grading response dict, mutated in place.
+    max_score:
+        Maximum score for clamping and proportional calculation.
+
+    Returns
+    -------
+    dict[str, Any]
+        The mutated ``data`` dict (for chained-call convenience).
     """
     steps = data.get("extracted_steps")
     if not isinstance(steps, list):
@@ -965,16 +1296,21 @@ def _validate_score(data: dict[str, Any], max_score: int) -> dict[str, Any]:
         1 for s in steps if isinstance(s, dict) and s.get("is_correct", False)
     )
 
-    step_score = round((correct / total) * max_score) if total > 0 else 0
+    step_ratio: float = (correct / total) if total > 0 else 0.0
+    step_score = round(step_ratio * max_score)
 
     current_score = _clamp_score(data.get("student_score", 0), max_score)
 
-    # Override: model said 0 but its own step list disagrees.
-    if current_score == 0 and correct > 0:
+    # Override: model said 0 but a majority of its own steps are correct.
+    # Requiring step_ratio >= 0.5 guards against the case where the student
+    # only copied the starting expression (step 1 correct) and got everything
+    # else wrong - that should not flip the score from 0.
+    if current_score == 0 and correct > 0 and step_ratio >= 0.5:
         logger.warning(
-            "grading: score=0 override correct=%d/%d new_score=%d",
+            "grading: score=0 override correct=%d/%d step_ratio=%.2f new_score=%d",
             correct,
             total,
+            step_ratio,
             step_score,
         )
         current_score = step_score
@@ -1002,7 +1338,20 @@ def _validate_score(data: dict[str, Any], max_score: int) -> dict[str, Any]:
 
 
 def _sanitize_step(raw_step: Any, fallback_index: int) -> dict[str, Any]:
-    """Normalise one step dict so Pydantic validation cannot fail on it."""
+    """Normalise one step dict so Pydantic validation cannot fail on it.
+
+    Parameters
+    ----------
+    raw_step:
+        Raw step dict from the model output.
+    fallback_index:
+        1-based index used when ``step_number`` is missing or unparseable.
+
+    Returns
+    -------
+    dict[str, Any]
+        Clean step dict with all required fields present and typed correctly.
+    """
     if not isinstance(raw_step, dict):
         raw_step = {}
 
@@ -1027,7 +1376,18 @@ def _sanitize_step(raw_step: Any, fallback_index: int) -> dict[str, Any]:
 
 
 def _sanitize_steps(raw_steps: Any) -> list[dict[str, Any]]:
-    """Coerce the model's ``extracted_steps`` field into a clean list."""
+    """Coerce the model's ``extracted_steps`` field into a clean list.
+
+    Parameters
+    ----------
+    raw_steps:
+        Raw ``extracted_steps`` value from the parsed response.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        List of sanitised step dicts; empty list for non-list inputs.
+    """
     if not isinstance(raw_steps, list):
         return []
     return [_sanitize_step(s, idx + 1) for idx, s in enumerate(raw_steps)]
@@ -1055,7 +1415,18 @@ def _coerce_optional_str(value: Any) -> str | None:
 
 
 def _normalize_confidence(value: Any) -> str:
-    """Map the model's confidence string onto the ``{high,medium,low}`` enum."""
+    """Map the model's confidence string onto the ``{high,medium,low}`` enum.
+
+    Parameters
+    ----------
+    value:
+        Raw confidence value from model output.
+
+    Returns
+    -------
+    str
+        One of ``"high"``, ``"medium"``, ``"low"``.
+    """
     if not isinstance(value, str):
         return "low"
     v = value.strip().lower()
@@ -1103,6 +1474,30 @@ def _build_messages(
     ``question_label``'s work only and IGNORE lines labelled with any
     of the other numbers. Prevents cross-question contamination of
     ``extracted_steps`` when one image carries multiple answers.
+
+    Parameters
+    ----------
+    pil_image:
+        Student's handwritten answer image.
+    question:
+        Original question text.
+    answer_key:
+        Full worked solution (step-by-step).
+    max_score:
+        Maximum score for this question.
+    subject:
+        Subject hint string.
+    strict_retry:
+        When ``True`` append the strict-retry suffix to the user prompt.
+    question_label:
+        Canonical question label when known, else ``None``.
+    other_questions_on_page:
+        Other question labels visible on the same page, else ``None``.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Chat-template messages list ready for ``apply_chat_template``.
     """
     # Build the context hint(s). Both notes share the same
     # ``{label_hint}`` substitution point in the template so the
@@ -1181,6 +1576,7 @@ def _run_generation(
     messages: list[dict[str, Any]],
     *,
     max_new_tokens: int = _MAX_NEW_TOKENS_PASS,
+    processor: Any = None,
 ) -> str:
     """Run one ``model.generate`` pass and return the decoded string.
 
@@ -1193,19 +1589,48 @@ def _run_generation(
     tighter value (e.g. 128) for short-form passes like question
     identification.
 
+    ``processor`` overrides the global ``_processor`` singleton for
+    this call only - used by the high-resolution retry path in
+    :func:`_grade_sync` where a temporary processor with a larger
+    ``max_pixels`` is created without mutating the global state.
+
+    Parameters
+    ----------
+    messages:
+        Chat-template message list.
+    max_new_tokens:
+        Token budget for this generation pass.
+    processor:
+        Optional processor override. Defaults to the module-level
+        ``_processor`` singleton when ``None``.
+
+    Returns
+    -------
+    str
+        Decoded model output (continuation only, prompt tokens stripped).
+
     Raises
     ------
+    GradingServiceUnavailable
+        If ``_device`` is ``None`` (model not loaded or load failed).
     RuntimeError
         CUDA OOM or other torch runtime failures propagate unchanged.
     """
+    if _device is None:
+        raise GradingServiceUnavailable(
+            "Grading model device is not initialised (load failed or CUDA unavailable)."
+        )
+
     import torch
     from qwen_vl_utils import process_vision_info
 
-    text = _processor.apply_chat_template(
+    active_proc = processor if processor is not None else _processor
+
+    text = active_proc.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     image_inputs, video_inputs = process_vision_info(messages)
-    inputs = _processor(
+    inputs = active_proc(
         text=[text],
         images=image_inputs,
         videos=video_inputs,
@@ -1213,6 +1638,9 @@ def _run_generation(
         return_tensors="pt",
     ).to(_device)
 
+    # Bind to None BEFORE generate so the finally-block del is always safe,
+    # even if generate() raises before assigning generated_ids.
+    generated_ids = None
     try:
         with torch.inference_mode():
             generated_ids = _model.generate(
@@ -1226,21 +1654,23 @@ def _run_generation(
             out_ids[len(in_ids):]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
-        output = _processor.batch_decode(
+        output = active_proc.batch_decode(
             trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
         return output[0] if output else ""
     finally:
-        # VRAM hygiene: release activations + input tensors so the
-        # allocator can compact before the next request.
+        # VRAM hygiene: release activations + input tensors in a strict
+        # order so the allocator can compact before the next request.
+        # Each del has its own try/except so one failure cannot skip
+        # the others.
         try:
             del inputs
         except Exception:
             pass
         try:
-            del generated_ids  # noqa: F821 - may be unbound if generate raised
+            del generated_ids
         except Exception:
             pass
         try:
@@ -1261,6 +1691,21 @@ def _parse_failed_fallback(
     dict so the client sees structured 200 JSON; the ``graded_by``
     field is suffixed with ``(parse failed)`` so ops/audit can spot
     these rows quickly.
+
+    Parameters
+    ----------
+    raw:
+        Raw model output that could not be parsed.
+    max_score:
+        Maximum score (echoed in the response).
+    original_bytes_len:
+        Length of the original image bytes (unused but kept for future
+        audit logging).
+
+    Returns
+    -------
+    dict[str, Any]
+        Zero-score grading response envelope.
     """
     truncated = (raw or "").strip()[:500] or "Could not parse grading response"
     return {
@@ -1288,6 +1733,7 @@ def _grade_sync(
     question_label: str | None = None,
     expected_final_answer: str | None = None,
     other_questions_on_page: list[str] | None = None,
+    _boost_resolution: bool = False,
 ) -> dict[str, Any]:
     """Blocking implementation of :func:`grade_answer`.
 
@@ -1297,13 +1743,56 @@ def _grade_sync(
        corrupt payloads).
     2. Acquire the GPU lock non-blockingly; fail fast with
        :class:`GradingBusy` if another request is mid-generation.
-    3. Run a single ``model.generate`` pass; on JSON parse failure
+    3. When ``_boost_resolution=True``, create a temporary processor
+       with ``max_pixels=_MAX_PIXELS_RETRY`` so the high-res retry
+       path gets more visual tokens without mutating the global state.
+    4. Run a single ``model.generate`` pass; on JSON parse failure
        retry once with the strict suffix. If both attempts fail,
        return the safe zero-score envelope.
-    4. Run ``_validate_score`` to enforce clamping, the score=0
-       override, and ``first_error_step`` back-fill.
-    5. Emit one structured log line with per-request metrics
-       (VRAM, inference time, parse state, step tally, final score).
+    5. Run ``_validate_score`` to enforce clamping, the score=0
+       override (majority-steps guard), and ``first_error_step``
+       back-fill.
+    6. Emit one structured log line with per-request metrics
+       (image_size, pixels, output_len, parse, retry, boost,
+       step tally, score, confidence, safety_net, VRAM, latency).
+
+    Parameters
+    ----------
+    image_bytes:
+        Raw image bytes.
+    question:
+        Question text.
+    answer_key:
+        Full worked solution.
+    max_score:
+        Maximum score.
+    subject:
+        Subject hint.
+    question_label:
+        Canonical question label when known.
+    expected_final_answer:
+        Expected final answer for the safety-net comparison.
+    other_questions_on_page:
+        Other question labels on the same page.
+    _boost_resolution:
+        When ``True``, create a temporary processor with the high-res
+        pixel cap (``_MAX_PIXELS_RETRY``) for this call only.
+
+    Returns
+    -------
+    dict[str, Any]
+        Grading response dict matching the ``GradingResponse`` schema.
+
+    Raises
+    ------
+    GradingServiceUnavailable
+        Model not loaded.
+    GradingBusy
+        GPU lock held by another request.
+    ValueError
+        Image cannot be decoded.
+    RuntimeError
+        CUDA OOM or other torch failure.
     """
     if not is_ready():
         raise GradingServiceUnavailable(
@@ -1324,6 +1813,26 @@ def _grade_sync(
     parse_retried = False
     raw = ""
 
+    # Build an optional boosted processor for the high-res retry path.
+    # We create it BEFORE acquiring the lock above so any import errors
+    # surface immediately without silently falling back to standard res.
+    boost_processor: Any = None
+    if _boost_resolution:
+        try:
+            from transformers import AutoProcessor as _AP
+            boost_processor = _AP.from_pretrained(
+                MODEL_ID,
+                min_pixels=_MIN_PIXELS,
+                max_pixels=_MAX_PIXELS_RETRY,
+            )
+        except Exception as exc:
+            logger.warning(
+                "grading: could not create boost processor "
+                "max_pixels_retry=%d; using default. error=%s",
+                _MAX_PIXELS_RETRY,
+                exc,
+            )
+
     try:
         # --- Pass 1 -----------------------------------------------------
         messages = _build_messages(
@@ -1332,10 +1841,10 @@ def _grade_sync(
             question_label=question_label,
             other_questions_on_page=other_questions_on_page,
         )
-        raw = _run_generation(messages)
+        raw = _run_generation(messages, processor=boost_processor)
 
         try:
-            data = _parse_json_response(raw)
+            data = _parse_json_response(raw, required_fields=_GRADING_REQUIRED_FIELDS)
             parse_success = True
         except (ValueError, json.JSONDecodeError) as exc:
             logger.warning(
@@ -1353,9 +1862,11 @@ def _grade_sync(
                 question_label=question_label,
                 other_questions_on_page=other_questions_on_page,
             )
-            raw = _run_generation(messages)
+            raw = _run_generation(messages, processor=boost_processor)
             try:
-                data = _parse_json_response(raw)
+                data = _parse_json_response(
+                    raw, required_fields=_GRADING_REQUIRED_FIELDS
+                )
                 parse_success = True
             except (ValueError, json.JSONDecodeError) as exc2:
                 logger.error(
@@ -1373,15 +1884,17 @@ def _grade_sync(
     if data is None:
         result = _parse_failed_fallback(raw, max_score, len(image_bytes))
         logger.info(
-            "grading: image_size_bytes=%d image_pixels_after_resize=%d "
-            "model_output_len=%d parse_success=%s parse_retried=%s "
-            "correct_steps=0 total_steps=0 final_score=0 vram_used_mb=%d "
-            "inference_ms=%.1f",
+            "grading: image_size_bytes=%d pixels=%d output_len=%d parse_success=%s "
+            "retried=%s boost=%s correct=0/%d score=0/%d confidence=low "
+            "safety_net=False vram_mb=%d ms=%.1f",
             len(image_bytes),
             pixels_after_resize,
             len(raw),
             parse_success,
             parse_retried,
+            _boost_resolution,
+            0,
+            max_score,
             _vram_used_mb(),
             inference_ms,
         )
@@ -1407,6 +1920,8 @@ def _grade_sync(
     total_steps = len(extracted_steps)
     correct_steps = sum(1 for s in extracted_steps if s.get("is_correct"))
     final_score = _clamp_score(data.get("student_score", 0), max_score)
+    confidence_val = _normalize_confidence(data.get("confidence"))
+    safety_net_val = bool(data.get("safety_net_engaged", False))
 
     result = {
         "student_score": final_score,
@@ -1417,7 +1932,7 @@ def _grade_sync(
         "method_correct": bool(data.get("method_correct", False)),
         "feedback": str(data.get("feedback", "") or "")[:4000],
         "is_correct": bool(data.get("is_correct", final_score == max_score)),
-        "confidence": _normalize_confidence(data.get("confidence")),
+        "confidence": confidence_val,
         "score_breakdown": str(
             data.get("score_breakdown") or f"{correct_steps}/{total_steps} steps correct"
         ),
@@ -1427,22 +1942,25 @@ def _grade_sync(
         # final answer. Frontends should show a "teacher-review
         # recommended" badge when this is True - the VLM's per-step
         # flags are not fully trusted in that case.
-        "safety_net_engaged": bool(data.get("safety_net_engaged", False)),
+        "safety_net_engaged": safety_net_val,
     }
 
     logger.info(
-        "grading: image_size_bytes=%d image_pixels_after_resize=%d "
-        "model_output_len=%d parse_success=%s parse_retried=%s "
-        "correct_steps=%d total_steps=%d final_score=%d vram_used_mb=%d "
-        "inference_ms=%.1f",
+        "grading: image_size_bytes=%d pixels=%d output_len=%d parse_success=%s "
+        "retried=%s boost=%s correct=%d/%d score=%d/%d confidence=%s "
+        "safety_net=%s vram_mb=%d ms=%.1f",
         len(image_bytes),
         pixels_after_resize,
         len(raw),
         parse_success,
         parse_retried,
+        _boost_resolution,
         correct_steps,
         total_steps,
         final_score,
+        max_score,
+        confidence_val,
+        safety_net_val,
         _vram_used_mb(),
         inference_ms,
     )
@@ -1469,6 +1987,12 @@ async def grade_answer(
     asyncio executor so the FastAPI event loop stays responsive.
     Nothing is written to disk; everything is held in memory for the
     duration of the call.
+
+    When the first grading pass returns ``confidence == "low"``, a
+    second pass is automatically attempted at boosted resolution
+    (``max_pixels=_MAX_PIXELS_RETRY``) to improve OCR accuracy on
+    small or blurry handwriting. One retry maximum; any failure during
+    the retry is logged and the original result is returned.
 
     Parameters
     ----------
@@ -1530,25 +2054,72 @@ async def grade_answer(
     GradingBusy
         Another grading request is still holding the GPU. Route maps
         to HTTP 503 with ``Retry-After: 10``.
+    GradingTimeout
+        The grading call exceeded ``_GRADING_TIMEOUT_S``. Route maps
+        to HTTP 503 with ``Retry-After: 30``.
     ValueError
         The image bytes could not be decoded. Route maps to HTTP 400.
     RuntimeError
         CUDA OOM or other torch failures mid-generation. Route maps
         OOM-ish messages to HTTP 503.
     """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        _grade_sync,
-        image_bytes,
-        question,
-        answer_key,
-        max_score,
-        subject,
-        question_label,
-        expected_final_answer,
-        other_questions_on_page,
-    )
+    loop = asyncio.get_running_loop()
+
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                _grade_sync,
+                image_bytes,
+                question,
+                answer_key,
+                max_score,
+                subject,
+                question_label,
+                expected_final_answer,
+                other_questions_on_page,
+                False,  # _boost_resolution=False for first pass
+            ),
+            timeout=_GRADING_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError as exc:
+        raise GradingTimeout(
+            f"Grading timed out after {_GRADING_TIMEOUT_S:.0f}s; retry shortly."
+        ) from exc
+
+    # Low-confidence retry at boosted resolution (one retry maximum).
+    if result.get("confidence") == "low":
+        logger.info(
+            "grading: confidence=low, retrying at boosted resolution "
+            "max_pixels_retry=%d boost=True",
+            _MAX_PIXELS_RETRY,
+        )
+        try:
+            result_retry = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    _grade_sync,
+                    image_bytes,
+                    question,
+                    answer_key,
+                    max_score,
+                    subject,
+                    question_label,
+                    expected_final_answer,
+                    other_questions_on_page,
+                    True,  # _boost_resolution=True
+                ),
+                timeout=_GRADING_TIMEOUT_S,
+            )
+            result = result_retry
+        except Exception as exc:
+            logger.warning(
+                "grading: boost-resolution retry failed retried=True boost=True; "
+                "returning original low-confidence result. error=%s",
+                exc,
+            )
+
+    return result
 
 
 # --------------------------------------------------------------------- question identification
@@ -1564,12 +2135,12 @@ async def grade_answer(
 # force the VLM to simultaneously read AND reason, which empirically
 # hurts both tasks.
 
-_IDENTIFY_SYSTEM_PROMPT = (
+_IDENTIFY_SYSTEM_PROMPT: str = (
     "You are reading a student's handwritten math work to identify "
     "which question they are answering. Do NOT grade. Do NOT solve."
 )
 
-_IDENTIFY_USER_PROMPT = """Look at the top of this handwritten page. Extract:
+_IDENTIFY_USER_PROMPT: str = """Look at the top of this handwritten page. Extract:
 
 1. question_number: if the student wrote a question number at the top
    of the page (e.g. "1.", "Q3", "Question 2", "#5", "2.a") return
@@ -1592,7 +2163,7 @@ OUTPUT RULES:
 
 # Short output budget. The JSON envelope is 60-120 tokens in practice;
 # 128 leaves a little headroom without letting the model run on.
-_IDENTIFY_MAX_NEW_TOKENS = int(os.getenv("GRADING_IDENTIFY_MAX_NEW_TOKENS", "128"))
+_IDENTIFY_MAX_NEW_TOKENS: int = int(os.getenv("GRADING_IDENTIFY_MAX_NEW_TOKENS", "128"))
 
 
 def _identify_sync(image_bytes: bytes) -> dict[str, Any]:
@@ -1605,6 +2176,26 @@ def _identify_sync(image_bytes: bytes) -> dict[str, Any]:
     is missing or illegible. On JSON parse failure we fall back to a
     zero-signal response rather than raising, so the caller can still
     ask the student to disambiguate via the 422 path.
+
+    Parameters
+    ----------
+    image_bytes:
+        Raw image bytes.
+
+    Returns
+    -------
+    dict[str, Any]
+        Identification result with keys ``question_number``,
+        ``problem_text``, ``read_confidence``.
+
+    Raises
+    ------
+    GradingServiceUnavailable
+        Model not loaded.
+    GradingBusy
+        GPU lock held by another request.
+    ValueError
+        Image cannot be decoded.
     """
     if not is_ready():
         raise GradingServiceUnavailable(
@@ -1658,7 +2249,7 @@ def _identify_sync(image_bytes: bytes) -> dict[str, Any]:
 
     logger.info(
         "identify: question_number=%r problem_text_len=%d read_confidence=%s "
-        "elapsed_ms=%.1f vram_used_mb=%d",
+        "elapsed_ms=%.1f vram_mb=%d",
         qn,
         len(pt or ""),
         rc,
@@ -1682,6 +2273,11 @@ async def identify_question(image_bytes: bytes) -> dict[str, Any]:
     :func:`app.services.question_resolver.resolve_question` to pick the
     matching :class:`AnswerKeyItem`.
 
+    Parameters
+    ----------
+    image_bytes:
+        Raw image bytes.
+
     Returns
     -------
     dict
@@ -1695,11 +2291,22 @@ async def identify_question(image_bytes: bytes) -> dict[str, Any]:
         Model failed to load at startup.
     GradingBusy
         Another grading request is holding the GPU.
+    GradingTimeout
+        The identification call exceeded ``_GRADING_TIMEOUT_S``.
     ValueError
         ``image_bytes`` could not be decoded.
     """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _identify_sync, image_bytes)
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _identify_sync, image_bytes),
+            timeout=_GRADING_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError as exc:
+        raise GradingTimeout(
+            f"Question identification timed out after {_GRADING_TIMEOUT_S:.0f}s; "
+            "retry shortly."
+        ) from exc
 
 
 # --------------------------------------------------------------------- multi-question identification
@@ -1712,12 +2319,12 @@ async def identify_question(image_bytes: bytes) -> dict[str, Any]:
 # than N independent "is question X here?" calls. The returned list
 # then drives the per-question grade loop in the route layer.
 
-_IDENTIFY_ALL_SYSTEM_PROMPT = (
+_IDENTIFY_ALL_SYSTEM_PROMPT: str = (
     "You are scanning a handwritten page to list which questions the "
     "student answered. Do NOT grade. Do NOT solve."
 )
 
-_IDENTIFY_ALL_USER_PROMPT = """Scan this handwritten page for QUESTION LABELS.
+_IDENTIFY_ALL_USER_PROMPT: str = """Scan this handwritten page for QUESTION LABELS.
 
 A question label is a number or short identifier at the start of a
 distinct section of student work, for example: "1.", "Q3", "0002.",
@@ -1753,13 +2360,13 @@ Example valid output:
 
 # Tighter than the grading pass (1024) but looser than single identify
 # (128) because multi-question can emit up to 5 entries.
-_IDENTIFY_ALL_MAX_NEW_TOKENS = int(
+_IDENTIFY_ALL_MAX_NEW_TOKENS: int = int(
     os.getenv("GRADING_IDENTIFY_ALL_MAX_NEW_TOKENS", "256")
 )
 
 # Hard cap on entries we process downstream even if the model emits
 # more. Prevents pathological pages from triggering 10+ grading passes.
-_IDENTIFY_ALL_MAX_RESULTS = int(
+_IDENTIFY_ALL_MAX_RESULTS: int = int(
     os.getenv("GRADING_MAX_QUESTIONS_PER_IMAGE", "5")
 )
 
@@ -1769,6 +2376,18 @@ def _sanitize_identification_entry(raw: Any, fallback_idx: int) -> dict[str, Any
 
     Returns ``None`` for entries that are clearly bogus (no usable
     question number). Never raises.
+
+    Parameters
+    ----------
+    raw:
+        Raw entry dict from the model output.
+    fallback_idx:
+        Fallback index for error messages (unused in output).
+
+    Returns
+    -------
+    dict[str, Any] | None
+        Sanitised entry, or ``None`` when the entry has no usable number.
     """
     if not isinstance(raw, dict):
         return None
@@ -1804,6 +2423,25 @@ def _identify_all_sync(image_bytes: bytes) -> list[dict[str, Any]]:
     Like :func:`_identify_sync` we swallow JSON parse failures rather
     than raising: the route layer can still 422 with "no questions
     detected" and let the client retry manually.
+
+    Parameters
+    ----------
+    image_bytes:
+        Raw image bytes.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Identified questions list (possibly empty).
+
+    Raises
+    ------
+    GradingServiceUnavailable
+        Model not loaded.
+    GradingBusy
+        GPU lock held by another request.
+    ValueError
+        Image cannot be decoded.
     """
     if not is_ready():
         raise GradingServiceUnavailable(
@@ -1873,7 +2511,7 @@ def _identify_all_sync(image_bytes: bytes) -> list[dict[str, Any]]:
             break
 
     logger.info(
-        "identify_all: detected=%d (cap=%d) elapsed_ms=%.1f vram_used_mb=%d "
+        "identify_all: detected=%d (cap=%d) elapsed_ms=%.1f vram_mb=%d "
         "labels=%r",
         len(out),
         _IDENTIFY_ALL_MAX_RESULTS,
@@ -1891,6 +2529,11 @@ async def identify_all_questions(image_bytes: bytes) -> list[dict[str, Any]]:
     the default executor so the FastAPI event loop stays responsive
     during the ~3-5s Qwen pass.
 
+    Parameters
+    ----------
+    image_bytes:
+        Raw image bytes.
+
     Returns
     -------
     list of dict
@@ -1905,11 +2548,22 @@ async def identify_all_questions(image_bytes: bytes) -> list[dict[str, Any]]:
         Model failed to load at startup.
     GradingBusy
         Another grading request is holding the GPU.
+    GradingTimeout
+        The identification call exceeded ``_GRADING_TIMEOUT_S``.
     ValueError
         ``image_bytes`` could not be decoded.
     """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _identify_all_sync, image_bytes)
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _identify_all_sync, image_bytes),
+            timeout=_GRADING_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError as exc:
+        raise GradingTimeout(
+            f"Multi-question identification timed out after {_GRADING_TIMEOUT_S:.0f}s; "
+            "retry shortly."
+        ) from exc
 
 
 # --------------------------------------------------------------------- eager load
