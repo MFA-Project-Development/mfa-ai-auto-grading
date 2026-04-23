@@ -240,7 +240,7 @@ async def upload_answer_key(
         db.commit()
 
         # Step 5: embed each chunk, write to Chroma, then record in SQL.
-        inserted_ids, previews = _embed_and_store(
+        total_inserted = _embed_and_store(
             chunks=chunks,
             file_record=file_record,
             item_repo=item_repo,
@@ -248,19 +248,17 @@ async def upload_answer_key(
         )
 
         # Step 6: final bookkeeping.
-        file_repo.update_totals(file_record, total_chunks=len(inserted_ids))
+        file_repo.update_totals(file_record, total_chunks=total_inserted)
         file_repo.update_status(file_record, IngestionStatus.COMPLETED)
         db.commit()
 
         return UploadResponse(
             success=True,
-            fileName=file_record.file_name,
+            label=file_record.file_name,
             fileId=file_id,
             ingestionStatus=file_record.ingestion_status,
             parserUsed=file_record.parser_used,
-            totalQuestions=len(inserted_ids),
-            insertedIds=inserted_ids,
-            previews=previews,
+            totalQuestions=total_inserted,
         )
 
     except HTTPException as exc:
@@ -676,15 +674,16 @@ def _embed_and_store(
     file_record: AnswerKeyFile,
     item_repo: AnswerKeyItemRepository,
     written_vector_ids: list[str],
-) -> tuple[list[str], list[dict]]:
+) -> int:
     """Embed each chunk, write it to Chroma, and persist the SQL row.
 
     The SQL row is the source of truth - ``vector_id`` links it to the
     ChromaDB document. We pre-generate the item UUID and reuse it as the
     Chroma id so the two stores share a single traceable identifier.
+
+    Returns the number of items successfully inserted.
     """
-    inserted_ids: list[str] = []
-    previews: list[dict] = []
+    inserted_count = 0
     seen_question_nos: set[str] = set()
 
     for chunk in chunks:
@@ -778,28 +777,9 @@ def _embed_and_store(
             formula_list=chunk.formula_list,
         )
 
-        inserted_ids.append(doc_id)
+        inserted_count += 1
 
-        if len(previews) < 10:
-            previews.append({
-                "docId": doc_id,
-                "itemId": str(item_id),
-                "questionNo": chunk.question_no,
-                "pages": chunk.page_numbers,
-                "chapter": chunk.chapter,
-                "answerText": chunk.answer_text,
-                "parserUsed": parser_name,
-                "headingText": chunk.heading_text,
-                "preview": chunk.content[:200],
-                "problemText": chunk.problem_text,
-                "solutionSteps": chunk.solution_steps,
-                "finalAnswer": chunk.final_answer,
-                "normalizedAnswer": chunk.normalized_answer,
-                "answerType": chunk.answer_type,
-                "formulaList": chunk.formula_list,
-            })
-
-    return inserted_ids, previews
+    return inserted_count
 
 
 def _page_bounds(page_numbers: list[int] | None) -> tuple[int | None, int | None]:

@@ -116,16 +116,3 @@ app.include_router(grading_pipeline_router, dependencies=_auth_required)
 @app.get("/", dependencies=_auth_required)
 def root() -> dict[str, str]:
     return {"message": "API is running"}
-
-
-@app.get("/api/v1/health/ocr", dependencies=_auth_required)
-def ocr_health(probe_engine: bool = False) -> dict[str, object]:
-    """Live health probe for the OCR fallback.
-
-    Query params:
-        probe_engine: when ``true``, force-build the PaddleOCR engine now so
-            the response reflects real initialization (useful when you want
-            to pre-warm the model). Default ``false`` keeps the call cheap
-            and side-effect-free.
-    """
-    return get_ocr_status(probe_engine=probe_engine)

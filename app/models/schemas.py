@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -66,22 +65,20 @@ class QuestionChunk(BaseModel):
 
 class UploadResponse(BaseModel):
     success: bool
-    fileName: str
+    label: str
     fileId: uuid.UUID
     ingestionStatus: str
     parserUsed: str | None = None
     totalQuestions: int
-    insertedIds: list[str]
-    previews: list[dict[str, Any]]
 
 
 class AnswerKeyFileRead(BaseModel):
     """File-level response shape used by list/detail endpoints."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     id: uuid.UUID
-    file_name: str
+    label: str = Field(validation_alias="file_name")
     original_file_name: str
     storage_path: str | None
     mime_type: str | None
