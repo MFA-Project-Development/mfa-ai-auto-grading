@@ -95,6 +95,15 @@ async def upload_answer_key(
     subject: str | None = Form(None),
     grade: str | None = Form(None),
     language: str | None = Form(None),
+    label: str | None = Form(
+        None,
+        description=(
+            "Optional display label for the uploaded file. When provided, "
+            "this value is stored as ``file_name`` instead of defaulting to "
+            "the original upload filename. ``original_file_name`` always "
+            "keeps the real uploaded filename."
+        ),
+    ),
     db: Session = Depends(get_db),
 ) -> UploadResponse:
     """Ingest an answer-key PDF or image.
@@ -116,9 +125,16 @@ async def upload_answer_key(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
+    # Prefer the user-supplied label as the display filename, falling back
+    # to the uploaded file's real name. ``original_file_name`` stays bound
+    # to the actual uploaded filename so we can always trace the source.
+    display_name = (label or "").strip() or file.filename
+
     logger.info(
-        "upload: file=%s kind=%s content_type=%s size=%d page_range=%r",
+        "upload: file=%s label=%r display=%s kind=%s content_type=%s size=%d page_range=%r",
         file.filename,
+        label,
+        display_name,
         kind,
         file.content_type,
         len(raw_bytes),
@@ -133,7 +149,7 @@ async def upload_answer_key(
     # row is observable to other transactions (monitoring, retries, etc.)
     # even if MinIO takes a while or fails outright.
     file_record = file_repo.create(
-        file_name=file.filename,
+        file_name=display_name,
         original_file_name=file.filename,
         source_type=SourceType.PDF if kind == "pdf" else SourceType.IMAGE,
         mime_type=file.content_type,
@@ -238,7 +254,7 @@ async def upload_answer_key(
 
         return UploadResponse(
             success=True,
-            fileName=file.filename,
+            fileName=file_record.file_name,
             fileId=file_id,
             ingestionStatus=file_record.ingestion_status,
             parserUsed=file_record.parser_used,
@@ -669,6 +685,7 @@ def _embed_and_store(
     """
     inserted_ids: list[str] = []
     previews: list[dict] = []
+    seen_question_nos: set[str] = set()
 
     for chunk in chunks:
         if not chunk.content.strip():
@@ -677,6 +694,19 @@ def _embed_and_store(
                 chunk.question_no, chunk.source_file,
             )
             continue
+
+        # Defense-in-depth against the (file_id, question_no) unique
+        # constraint: parsers should already de-duplicate, but a bad
+        # regex/anchor in any future parser would otherwise abort the
+        # whole upload with an IntegrityError. First-wins, log, skip.
+        if chunk.question_no in seen_question_nos:
+            logger.warning(
+                "upload: skipping duplicate question_no=%s file=%s parser=%s "
+                "(first occurrence already stored)",
+                chunk.question_no, chunk.source_file, chunk.parser_used,
+            )
+            continue
+        seen_question_nos.add(chunk.question_no)
 
         # The parsers now attach a structured projection onto every
         # chunk; use it to build a cleaner embedding and to feed both
