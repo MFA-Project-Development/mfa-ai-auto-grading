@@ -1,50 +1,72 @@
-"""Qwen2.5-VL-7B-Instruct grading service (bitsandbytes 4-bit NF4).
+"""Hybrid OCR + LLM grading service.
 
-This module owns the vision-language model used to auto-grade a
-student's handwritten step-by-step solution. It is tuned for an
-RTX 5080 (16 GB VRAM, CUDA 12.8) and designed to stay under a ~14 GB
-peak allocation covering both the model weights and the per-request
-inference activations.
+Auto-grades a student's handwritten step-by-step solution using a
+two-stage pipeline:
 
-Architecture
-------------
+1. **OCR stage (GLM-OCR, ``zai-org/GLM-OCR``)** transcribes the
+   handwritten image into plain-text math lines. The OCR engine lives
+   in :mod:`app.services.ocr_service` and is loaded lazily; this
+   module reuses that singleton via
+   :func:`app.services.ocr_service.transcribe_image` so the GLM-OCR
+   weights are only loaded once per process even when both answer-key
+   ingestion and student-answer grading are active.
+2. **LLM stage (``Qwen/Qwen2.5-VL-7B-Instruct``, bnb 4-bit NF4)**
+   grades the transcription against a retrieved answer-key. The
+   Qwen2.5-VL backbone is used as a pure **text LLM** here - no
+   image is passed through ``apply_chat_template`` anymore, so the
+   vision encoder and ``qwen_vl_utils.process_vision_info`` step are
+   skipped. Qwen performs the RAG generation step: given the
+   student's transcribed work plus the retrieved answer-key context,
+   it emits the step-by-step grading JSON.
 
-- **Model**: ``Qwen/Qwen2.5-VL-7B-Instruct`` loaded with
-  :class:`~transformers.BitsAndBytesConfig` in 4-bit NF4 (double
-  quantisation, fp16 compute dtype). We load via ``bitsandbytes``
-  rather than AWQ because ``autoawq`` has no supported wheel on
-  Windows + Python 3.11 + torch 2.11 / CUDA 12.8 (Blackwell sm_120):
-  its ``triton`` dependency lacks a Windows wheel and the last
-  ``autoawq`` release predates torch 2.11. ``bitsandbytes`` 0.49+
-  ships native Windows wheels with Blackwell kernels, so NF4 4-bit
-  is the drop-in equivalent here. Weights land in VRAM at roughly
-  ~5-6 GB (comparable to the AWQ build).
-- **Resolution cap**: the processor is pinned to the range
-  ``[256*28*28, 1024*28*28]`` pixels (200,704 - 802,816). This single
-  knob is the biggest lever on peak VRAM - a 12 MP phone photo would
-  otherwise balloon the visual-token activations into the 6 GB range.
-  The upper bound was raised from ``512*28*28`` so that cursive
-  character pairs like ``+`` vs ``-`` and ``3`` vs ``8`` get enough
-  pixels to be disambiguated on legible handwriting (adds roughly
-  ~2 GB of activation headroom, still well under the 14 GB budget).
-- **Fragmentation mitigation**: ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``
-  is set *before* torch is imported so the allocator can grow/shrink
-  segments instead of fragmenting the reserved pool across requests.
-- **Single inference pass**: the prompt asks the model to read the
-  handwriting AND verify the math in one response; a second pass is
-  only performed when the first output fails JSON parsing.
-- **Per-request cleanup**: after each ``model.generate`` call we
-  explicitly ``del inputs`` and ``torch.cuda.empty_cache()`` so the
-  next request sees a freshly-compacted allocator.
+Why split OCR from grading?
+---------------------------
+
+The previous architecture used Qwen2.5-VL for both reading AND
+reasoning in one shot. That wasted capacity two ways: Qwen's visual
+encoder is strong but not OCR-tuned, and forcing a single prompt to
+handle "read handwriting correctly" AND "reason about math mistakes"
+empirically hurt both. Splitting lets each model do what it's best at:
+GLM-OCR is purpose-built for multilingual handwriting transcription,
+and Qwen's text side handles math reasoning on clean input.
+
+RAG role
+--------
+
+Retrieval is performed upstream by
+:func:`app.services.question_resolver.resolve_question`: the caller
+embeds the student's detected text/question number with ``bge-m3``,
+searches the Chroma collection scoped to the target ``file_id``, and
+picks the matching :class:`AnswerKeyItem`. ``grade_answer``'s
+``answer_key`` parameter is the retrieved context; an optional
+``retrieval_context`` parameter can inject *additional* similar-problem
+chunks the caller has already fetched. Qwen then generates against the
+combined retrieved context - the "generation" step of RAG.
+
+Hardware notes
+--------------
+
+- Tuned for an RTX 5080 (16 GB VRAM, CUDA 12.8). Qwen2.5-VL-7B in
+  4-bit NF4 uses ~5-6 GB; GLM-OCR is loaded with ``device_map="auto"``
+  so it spills to CPU if VRAM is tight. Set ``GLM_OCR_MODEL_PATH`` to
+  a smaller OCR model or run on a bigger GPU if you see OOM.
+- ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` is set *before*
+  torch is imported so the allocator can grow/shrink segments instead
+  of fragmenting across requests.
+- ``bitsandbytes`` 0.49+ ships native Windows wheels with Blackwell
+  kernels - that's the drop-in substitute for ``autoawq``, which has
+  no working wheel on Windows + torch 2.11 / sm_120.
 
 Concurrency
 -----------
 
-Only one generation may run at a time on a single GPU. We guard
+Only one Qwen generation may run at a time on the GPU. We guard
 inference with a non-blocking :class:`threading.Lock`; if a previous
 (likely timed-out) request is still holding the GPU, we raise
 :class:`GradingBusy` so the caller sees an immediate 503 with a
 ``Retry-After`` header rather than stacking up executor threads.
+GLM-OCR transcription happens BEFORE the lock is acquired so a slow
+OCR pass doesn't keep the grading GPU lock held.
 """
 
 from __future__ import annotations
@@ -73,42 +95,115 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------- constants
 
 MODEL_ID: str = "Qwen/Qwen2.5-VL-7B-Instruct"
-MODEL_DISPLAY_NAME: str = "Qwen2.5-VL-7B-Instruct (bnb-4bit)"
+MODEL_DISPLAY_NAME: str = "Qwen2.5-VL-7B-Instruct (bnb-4bit) + GLM-OCR"
 
-# Image-resolution bounds in pixels. Qwen2.5-VL tiles the image into
-# 28x28 patches; clamping both ends of the range keeps the visual
-# token sequence predictable and keeps activations in VRAM bounded.
-#
-# Upper bound was raised from 512*28*28 (401 k) to 1024*28*28 (802 k)
-# after we observed the 7B model confusing cursive ``+``/``-`` and
-# ``3``/``8`` on real student handwriting at the lower cap. The higher
-# cap roughly doubles the visual-token budget (~128 -> ~256 merged
-# tokens) which translates to +1-2 GB of activation memory during
-# inference - still well inside the 14 GB VRAM budget on the RTX 5080.
-# Override with env vars if you need to pin a different range.
-_MIN_PIXELS: int = int(os.getenv("GRADING_MIN_PIXELS", str(256 * 28 * 28)))   # 200,704
-_MAX_PIXELS: int = int(os.getenv("GRADING_MAX_PIXELS", str(1024 * 28 * 28)))  # 802,816
-
-# Max tokens the model may emit in a single pass. Enough headroom for
-# ~20 step JSON with prose feedback; override via env for edge cases.
+# Max tokens the Qwen grader may emit in a single pass. Enough headroom
+# for ~20 step JSON with prose feedback; override via env for edge cases.
 _MAX_NEW_TOKENS_PASS: int = int(os.getenv("GRADING_MAX_NEW_TOKENS", "1024"))
+
+# Tighter budgets for the identification passes - they only return
+# a small JSON envelope (question label + optional preview), so we
+# do not need the full grading budget.
+_IDENTIFY_MAX_NEW_TOKENS: int = int(
+    os.getenv("GRADING_IDENTIFY_MAX_NEW_TOKENS", "128")
+)
+_IDENTIFY_ALL_MAX_NEW_TOKENS: int = int(
+    os.getenv("GRADING_IDENTIFY_ALL_MAX_NEW_TOKENS", "256")
+)
+
+# Hard cap on detected questions we process downstream even if Qwen
+# hallucinates more. Prevents pathological pages from triggering 10+
+# grading passes. Must match the cap in the route layer.
+_IDENTIFY_ALL_MAX_RESULTS: int = int(
+    os.getenv("GRADING_MAX_QUESTIONS_PER_IMAGE", "5")
+)
+
+# Generation budget for the handwriting OCR pass used when producing
+# the transcription fed to the grading LLM. Real pages with 20+ math
+# steps transcribe into ~250-500 tokens; 2048 gives comfortable
+# headroom without making the model spin through thousands of empty
+# tokens before EOS (each one costs a full forward pass).
+_OCR_MAX_NEW_TOKENS: int = int(os.getenv("GRADING_OCR_MAX_NEW_TOKENS", "2048"))
+
+# Tighter OCR budget for the identify passes. They only need enough
+# of the page to surface question labels + starting expressions, so
+# capping generation much lower here keeps the per-call latency well
+# under the grading pass's budget.
+_OCR_IDENTIFY_MAX_NEW_TOKENS: int = int(
+    os.getenv("GRADING_OCR_IDENTIFY_MAX_NEW_TOKENS", "512")
+)
+
+# Prompt sent to GLM-OCR for student handwriting. Plain "Text
+# Recognition:" keeps the output verbatim (one line per physical line)
+# which is exactly what the grading LLM needs. Override via env if
+# you need to specialise for a subject.
+_OCR_PROMPT: str = os.getenv("GRADING_OCR_PROMPT", "Text Recognition:")
 
 # Wall-clock budget (in seconds) for a single run_in_executor grading call.
 # When exceeded the async wrapper raises GradingTimeout so the route layer
 # can return 503 + Retry-After instead of blocking the executor pool.
 # Override via GRADING_TIMEOUT_S env var. The route layer adds its own
 # (typically larger) asyncio.wait_for budget on top of this.
-_GRADING_TIMEOUT_S: float = float(os.getenv("GRADING_TIMEOUT_S", "120"))
-
-# Maximum pixel budget used during a low-confidence resolution retry.
-# Roughly 4× the default cap (4096 tile slots vs 1024). Override via
-# GRADING_MAX_PIXELS_RETRY env var if you hit VRAM limits on retry.
-_MAX_PIXELS_RETRY: int = int(os.getenv("GRADING_MAX_PIXELS_RETRY", str(2048 * 28 * 28)))
+_GRADING_TIMEOUT_S: float = float(os.getenv("GRADING_TIMEOUT_S", "180"))
 
 # Set GRADING_PREPROCESS_IMAGES=0 to skip opencv preprocessing entirely
 # (useful for already-clean digital scans where denoising/deskewing is
-# a no-op at best or harmful at worst). Defaults to enabled.
+# a no-op at best or harmful at worst). Preprocessing now feeds GLM-OCR
+# rather than Qwen's visual encoder, so the same denoise/deskew/
+# binarise pipeline still improves accuracy. Defaults to enabled.
 _GRADING_PREPROCESS: bool = os.getenv("GRADING_PREPROCESS_IMAGES", "1") == "1"
+
+# Optional extra RAG retrieval on top of the answer-key already passed
+# in from the resolver. When enabled, the grader embeds the student's
+# OCR'd transcription and fetches top-K similar-problem chunks from
+# Chroma (scoped to the same file_id). Set to 0 to disable; defaults
+# to 0 because the resolver already supplies the best single chunk.
+_RAG_EXTRA_TOP_K: int = int(os.getenv("GRADING_RAG_EXTRA_TOP_K", "0"))
+
+# ----- Final-answer safety net ------------------------------------------------
+# The safety net in ``_repair_final_answer_match`` upgrades a response to
+# full-marks when the expected final answer appears in one of the VLM's
+# ``extracted_steps[].student_wrote`` fields. It was designed to paper over
+# cursive-3-vs-8 transcription noise, but a too-permissive match can also
+# paper over GENUINE errors:
+#
+#   * Qwen sometimes copies the expected answer out of its own user-prompt
+#     (the ``answer_key`` block) into ``student_wrote``, even when the raw
+#     GLM-OCR transcription never contained that string. We call that the
+#     "VLM leaked the answer key" failure mode.
+#   * When the student simplifies in one step, an intermediate line can
+#     legitimately equal the final answer. If the student THEN continues
+#     and writes a wrong final line, "match-anywhere" still fires and
+#     the student gets full marks for work they did wrong.
+#
+# Three env knobs let you control the behaviour without code changes:
+#
+#   GRADING_FINAL_ANSWER_SAFETY_NET             (default 1)
+#     Master switch. Set to 0 to disable the safety net entirely - useful
+#     while you are tuning Qwen's per-step grading accuracy and do not
+#     want spurious upgrades masking real errors.
+#
+#   GRADING_SAFETY_NET_REQUIRE_LAST_STEP        (default 1)
+#     Only accept a match that lands on the LAST non-empty extracted step.
+#     Set to 0 to restore the legacy "match anywhere in the step list"
+#     behaviour, which is more forgiving of VLM line-drops but also more
+#     prone to crediting wrong final-line work.
+#
+#   GRADING_SAFETY_NET_VERIFY_TRANSCRIPTION     (default 1)
+#     Cross-check that the expected answer also appears (whitespace-
+#     insensitive) in the raw GLM-OCR transcription. This defeats the
+#     "Qwen leaked the answer key into student_wrote" failure mode: if
+#     OCR never saw the expected string, the match cannot be trusted.
+#     Set to 0 to skip the cross-check (legacy behaviour).
+_GRADING_SAFETY_NET_ENABLED: bool = (
+    os.getenv("GRADING_FINAL_ANSWER_SAFETY_NET", "1") == "1"
+)
+_GRADING_SAFETY_NET_REQUIRE_LAST_STEP: bool = (
+    os.getenv("GRADING_SAFETY_NET_REQUIRE_LAST_STEP", "1") == "1"
+)
+_GRADING_SAFETY_NET_VERIFY_TRANSCRIPTION: bool = (
+    os.getenv("GRADING_SAFETY_NET_VERIFY_TRANSCRIPTION", "1") == "1"
+)
 
 
 # --------------------------------------------------------------------- exceptions
@@ -144,83 +239,96 @@ class GradingTimeout(RuntimeError):
     """
 
 
-# --------------------------------------------------------------------- OCR rule constants
+# --------------------------------------------------------------------- reasoning rule constants
 # These are injected into the user prompt (via string concatenation in
 # _USER_PROMPT_TEMPLATE) so each rule block can be tuned independently
 # without touching the surrounding template. The template calls .format()
 # on the concatenated result, so any literal curly braces here must be
 # doubled ({{ / }}).
+#
+# NOTE: these were originally "OCR rules" that asked the VLM to read
+# the handwriting. Reading is now GLM-OCR's job, so these blocks have
+# been rewritten to operate on the TRANSCRIBED text: how to normalise
+# math notation the OCR emitted, and how to line up transcribed lines
+# against expected steps.
 
 _SYMBOL_RULES: str = """\
-CRITICAL SYMBOL READING RULES:
-- Carefully distinguish: 3 vs 8, 1 vs 7, 0 vs 6, 4 vs 9
-- Carefully distinguish: + vs t, - vs em-dash, × vs x (variable)
-- Carefully distinguish: y vs q vs g, n vs u, a vs d, z vs 2
-- When a character is ambiguous choose the reading that makes \
-the transformation follow LOGICALLY from the previous step
-- Superscripts: x² → x^2, x³ → x^3 (always use ^ notation)
-- Greek: α→alpha, β→beta, π→pi, Σ→sum, Δ→delta"""
+TRANSCRIPTION NORMALISATION:
+- The transcription was produced by GLM-OCR and may contain residual \
+ambiguities. Before comparing, treat these pairs as interchangeable if \
+one reading makes the math follow logically: 3/8, 1/7, 0/6, 4/9, +/t, \
+-/em-dash, ×/x-variable, y/q/g, n/u, a/d, z/2.
+- Superscripts are written as ``^N`` (x^2, x^3) - compare accordingly.
+- Greek letters may appear as words: alpha, beta, pi, sum, delta."""
 
 _STRUCTURE_RULES: str = """\
-MATH STRUCTURE ENCODING:
-- Fraction: (x+1) over (x-2) → (x+1)/(x-2)
-- Exponent: x squared → x^2
-- Square root: root of (x+1) → sqrt(x+1)
-- Subscript: x sub 1 → x_1
-- Absolute value: |x+1| → |x+1|
-- Integral: ∫x dx → integral(x)dx
-- Always preserve all parentheses present in original writing
-- Mixed number: 2½ → 2 + 1/2"""
+MATH STRUCTURE CONVENTIONS:
+- Fractions: ``(x+1)/(x-2)``
+- Exponents: ``x^2``
+- Square root: ``sqrt(x+1)``
+- Subscripts: ``x_1``
+- Absolute value: ``|x+1|``
+- Integrals: ``integral(x)dx``
+- Mixed numbers: ``2 + 1/2``
+- Preserve every parenthesis the transcription contains."""
 
 _LAYOUT_RULES: str = """\
-LAYOUT READING RULES:
-- If a math expression continues on the next physical line \
-(indented or aligned) treat it as ONE step, not two
-- Vertical addition/subtraction column layouts → single expression
-- Ignore ruled lines, margin borders, printed page decorations
-- Student work flows strictly top-to-bottom; read in that order
-- A line that is only '=' followed by a result is still its own \
-step — do not merge it with the preceding line"""
+STEP-SPLITTING RULES:
+- Each non-empty line of the transcription is ONE candidate step.
+- If a line starts with ``=`` alone, still treat it as its own step.
+- Skip blank lines and lines that contain only punctuation (``-``, \
+``*``, ``_``) - those are stray OCR artefacts from rulings / borders.
+- Student work flows strictly top-to-bottom in the transcription, so \
+iterate it in order."""
 
 _COUNT_VERIFICATION: str = """\
-LINE-COUNT VERIFICATION (do this BEFORE outputting JSON):
-1. Count every visible '=' sign on the page → call this E
-2. Count every distinct horizontal line of math → call this L
-3. Your extracted_steps list MUST contain AT LEAST max(E,L) entries
-4. The LAST line the student wrote MUST be the final entry
-5. If your entry count is less than E or L, re-read the image \
-and add the missing lines before producing JSON"""
+STEP-COUNT VERIFICATION (do this BEFORE outputting JSON):
+1. Count the non-empty lines in the transcription → call this L.
+2. Your ``extracted_steps`` list MUST contain exactly L entries \
+(one per line), unless two physical lines clearly belong to the \
+same math expression (a continuation) - in that case combine them \
+into one step.
+3. The LAST non-empty line in the transcription MUST be represented \
+as the final entry in ``extracted_steps``. Dropping the final line \
+is the most common failure mode; guard against it explicitly."""
 
 
 # --------------------------------------------------------------------- prompt
 
 _SYSTEM_PROMPT: str = (
-    "You are a math teacher grading a handwritten student solution. "
-    "You will READ the handwriting AND verify the math in ONE response."
+    "You are a math teacher grading a student's solution. The student's "
+    "handwritten work has already been OCR-transcribed for you. Compare "
+    "the transcription line-by-line against the answer key and produce "
+    "structured JSON feedback."
 )
 
 # Double-braces ({{ / }}) are str.format escapes for literal { / }.
-# Single-braced {question}, {answer_key}, {max_score}, {subject},
-# {label_hint} are the real substitution points. ``{label_hint}`` is
-# filled by ``_build_messages`` - either an empty string or a line
-# telling the model the exact question-number label to strip (we know
-# it when the request came through ``/submit-by-image``).
+# Single-braced {transcription}, {question}, {answer_key}, {max_score},
+# {subject}, {label_hint}, {retrieval_block} are the real substitution
+# points. ``{label_hint}`` is filled by ``_build_messages`` - either an
+# empty string or a line telling the model the exact question-number
+# label to strip (we know it when the request came through
+# ``/submit-by-image``). ``{retrieval_block}`` is filled with extra RAG
+# context chunks when the caller supplies them (empty string otherwise).
 #
-# The OCR rule constants (_SYMBOL_RULES, _STRUCTURE_RULES, _LAYOUT_RULES,
-# _COUNT_VERIFICATION) are concatenated as separate module-level strings
-# so each block can be tuned independently. They are inserted between the
-# {label_hint} substitution point and STEP 1 to ensure the model applies
-# them during the reading phase.
+# The reasoning rule constants (_SYMBOL_RULES, _STRUCTURE_RULES,
+# _LAYOUT_RULES, _COUNT_VERIFICATION) are concatenated as separate
+# module-level strings so each block can be tuned independently.
 _USER_PROMPT_TEMPLATE: str = (
     """\
-Grade this handwritten math solution.
+Grade this student's solution.
 
 Question: {question}
 Full correct solution (answer key):
 {answer_key}
-Maximum score: {max_score}
+{retrieval_block}Maximum score: {max_score}
 Subject: {subject}
 {label_hint}
+Student's handwritten work (transcribed by GLM-OCR, one line per \
+physical line; do NOT change the order):
+<<<TRANSCRIPTION_BEGIN
+{transcription}
+TRANSCRIPTION_END>>>
 """
     + _SYMBOL_RULES
     + "\n\n"
@@ -231,26 +339,26 @@ Subject: {subject}
     + _COUNT_VERIFICATION
     + """
 
-STEP 1 - READ the handwriting and TRANSCRIBE the math:
-For EACH line of mathematical working the student wrote, emit ONE
-entry in ``extracted_steps`` with its ``student_wrote`` field set
-to the math content of that line.
+STEP 1 - MIRROR the transcription into extracted_steps:
+Walk the transcription top-to-bottom. For EACH non-empty line, emit ONE
+entry in ``extracted_steps`` with its ``student_wrote`` field set to
+that line's math content. Preserve the line's math verbatim - do not
+rewrite, do not "correct" what the student wrote, do not reorder.
 
 DO NOT skip any lines. In particular, ALWAYS include the student's
-LAST line (the final answer they arrived at) as its own entry in
-``extracted_steps``. Missing the final line is a common failure;
-count the visible "=" signs on the page and make sure you emitted
-at least that many step entries plus one for the starting expression.
+LAST transcription line (the final answer they arrived at) as its own
+entry in ``extracted_steps``. Missing the final line is a common
+failure.
 
 CRITICAL - Question labels are NOT math. Strip them before writing
 ``student_wrote``:
 Question labels like "1.", "Q3", "<label>.", "Question 5:", "(3)" at
-the very start of the page are METADATA. They MUST NOT appear in
-``student_wrote``. A label's presence is NEVER grounds for
+the very start of the transcription are METADATA. They MUST NOT appear
+in ``student_wrote``. A label's presence is NEVER grounds for
 ``is_correct: false`` - strip it, then compare.
 
 Example - this is the exact failure mode to avoid:
-  Page starts with:  "<label>. (3x^2+2xy-y^2)-(x^2-5xy-4y^2)"
+  Transcription begins with:  "<label>. (3x^2+2xy-y^2)-(x^2-5xy-4y^2)"
 
   CORRECT output:
     {{"step_number": 1,
@@ -265,24 +373,32 @@ Example - this is the exact failure mode to avoid:
       "error": "includes question label"}}
 
 If the student copied the starting expression correctly, step 1
-is correct regardless of any label on the page.
+is correct regardless of any label in the transcription.
 
 STEP 2 - VERIFY each step:
 The answer key lists the expected steps in order as "Step 1",
-"Step 2", ... Match student line N against the answer key's
+"Step 2", ... Match transcription line N against the answer key's
 Step N (same number). In the ``expected`` field for each student
 step, put the answer key's Step N text. Do NOT put the final
 answer there unless this IS the final-answer step.
 
 CRITICAL VERIFICATION RULES:
 - Rule 0: Strip question labels before comparing. A leading "Q3.",
-  "<label>.", "(3)", "Question 5:" at the top of the student's page is
+  "<label>.", "(3)", "Question 5:" at the top of the transcription is
   a question NUMBER, not a coefficient or part of the math. Never
   flag it as a coefficient mismatch against the expected expression.
 - Rule 1: After stripping the label, step 1 must show the EXACT
   expression from the question (this is also the answer key's
-  Step 1 "starting expression"). Check every coefficient and sign
-  individually. (2x^2-xy+3y^2) != (x^2+xy+3y^2) -> step 1 is WRONG.
+  Step 1 "starting expression"). Perform a character-by-character
+  comparison on:
+    * every coefficient (e.g. "3x^2" vs "2x^2" -> WRONG),
+    * every sign before every term (e.g. "+y^2" vs "-y^2" -> WRONG),
+    * every exponent (e.g. "x^2" vs "x^3" -> WRONG),
+    * every bracket structure.
+  A single sign flip or coefficient mismatch in step 1 makes step 1
+  wrong, even if subsequent steps "make sense" given the wrong
+  starting expression. Do NOT credit step 1 because the student's
+  intent is obvious; grade what they actually wrote.
 - Rule 2: Each subsequent student step must (a) follow mathematically
   from the previous student step AND (b) match the answer key's step
   with the same number, character by character on coefficients and
@@ -290,20 +406,56 @@ CRITICAL VERIFICATION RULES:
 - Rule 3: If step N is wrong, steps after it that use the wrong
   result are 'affected by step N error' - note dependency but
   do not penalise the method again if approach is still valid.
-- Rule 4: Award marks proportionally per correct step.
-- Rule 5 (FINAL ANSWER PRIORITY): If the student's LAST step
-  contains the expected "Final answer" (ignoring a leading "=" and
-  whitespace), the student reached the correct result. In that case
-  award full marks regardless of uncertainty in any intermediate
-  step - the correct final answer is strong evidence that the
-  intermediate work is mathematically valid.
-- Rule 6 (HANDWRITING AMBIGUITY): Cursive digits can be ambiguous
-  (3 vs 8, 1 vs 7, 0 vs 6, 4 vs 9). When a character is unclear,
-  use mathematical consistency to resolve it: if reading it one way
-  makes the transformation follow logically from the previous step
-  AND reading the other way does not, choose the reading that makes
-  the math work. Never mark a step wrong because of an ambiguous
-  character that has a correct reading.
+- Rule 4 (PROPORTIONAL SCORING): Award marks strictly proportionally
+  per correct step. If there are N extracted_steps and K of them are
+  correct, student_score MUST equal round(K / N * max_score). Do NOT
+  award more than this just because the final answer happens to match;
+  intermediate-step errors always cost marks. If ``is_correct`` is
+  ``false`` for ANY step, ``student_score`` MUST be strictly less than
+  ``max_score``. A self-contradictory response (e.g. ``is_correct:
+  false`` at top level but ``student_score: max_score``) will be
+  rejected.
+- Rule 5 (TRANSCRIPTION IS AUTHORITATIVE): The GLM-OCR transcription
+  between the <<<TRANSCRIPTION_BEGIN ... TRANSCRIPTION_END>>> markers
+  is the SOLE source of truth for what the student wrote. Do NOT
+  "correct" the transcription to make the math work. Do NOT
+  substitute a character (digit, sign, coefficient, exponent) even
+  if an alternate reading would make the step follow logically.
+  In particular:
+    * If the transcription shows "+y^2" where the question has "-y^2",
+      step 1 is WRONG - the student copied the sign incorrectly.
+      Do not flip "+" to "-" just because "-" would match the question.
+    * If the transcription shows "3y^2" where "5y^2" would make the
+      arithmetic close, step N is WRONG. Do not change "3" to "5".
+    * If the student's final line happens to equal the expected
+      final answer but is inconsistent with their own preceding
+      step, the preceding step is STILL wrong - mark it wrong and
+      note the inconsistency in the error field.
+  Character errors in the transcription ARE student errors for the
+  purpose of grading. If OCR truly misread a character the operator
+  will see it in the response and can regrade manually; that is
+  strictly better than silently crediting wrong work.
+
+FEEDBACK DETAIL REQUIREMENTS (for each wrong step):
+- The step's ``error`` field MUST include (1) what the student wrote,
+  quoted verbatim, (2) what the answer key expected, quoted verbatim,
+  and (3) the specific discrepancy (which term / coefficient / sign /
+  operator differs).
+  Bad:  "wrong coefficient of xy"
+  Good: "student wrote '5xy' but the expected step 2 has '7xy'; the
+         coefficient of xy is off by 2 - the student forgot to add the
+         '+5xy' that comes from distributing -(x^2-5xy-4y^2)".
+- The top-level ``feedback`` field MUST aggregate per-step errors in
+  one or two sentences that a student could act on. Include the step
+  number, what they wrote, and what they should have written.
+  Bad:  "Step 2: wrong coefficient of xy."
+  Good: "Step 2 is wrong: you wrote '5x^2+2xy-xy+3y^2+y^2' but the
+         expansion should be '5x^2+2xy-xy+3y^2+y^2+4xy' - you dropped
+         the '+4xy' term from the third bracket. Step 3 carries the
+         same error into '5x^2+xy+4y^2' where the correct result is
+         '5x^2+5xy+4y^2'."
+- ``error_summary`` is a one-line headline (<= 120 chars) for dashboards
+  and should name the single most important thing that went wrong.
 
 OUTPUT RULES (strictly follow):
 - Output RAW JSON only
@@ -315,25 +467,32 @@ OUTPUT RULES (strictly follow):
   "extracted_steps": [
     {{
       "step_number": 1,
-      "student_wrote": "exact transcription of this line",
-      "expected": "what this line should be per answer key",
+      "student_wrote": "(5x^2+2xy)-(xy-3y^2)+(y^2+4xy)",
+      "expected":      "(5x^2+2xy)-(xy-3y^2)+(y^2+4xy)",
       "is_correct": true,
       "error": null
     }},
     {{
       "step_number": 2,
-      "student_wrote": "exact transcription",
-      "expected": "correct version",
+      "student_wrote": "5x^2+2xy-xy+3y^2+y^2",
+      "expected":      "5x^2+2xy-xy+3y^2+y^2+4xy",
       "is_correct": false,
-      "error": "specific error: wrong coefficient of x^2, student wrote 2 but should be 3"
+      "error": "student wrote '5x^2+2xy-xy+3y^2+y^2' but after distributing -(xy-3y^2) and then +(y^2+4xy) the expansion should be '5x^2+2xy-xy+3y^2+y^2+4xy'; the '+4xy' term from the third bracket was dropped. Discrepancy: missing '+4xy'."
+    }},
+    {{
+      "step_number": 3,
+      "student_wrote": "5x^2+xy+4y^2",
+      "expected":      "5x^2+5xy+4y^2",
+      "is_correct": false,
+      "error": "student wrote '5x^2+xy+4y^2' but the correct combination of like terms gives '5x^2+5xy+4y^2'; the coefficient of xy is 1 instead of 5 because the '+4xy' lost in step 2 carries through. Discrepancy: xy coefficient off by 4."
     }}
   ],
   "first_error_step": 2,
-  "error_summary": "Student copied wrong starting expression in step 1",
+  "error_summary": "Dropped '+4xy' when distributing the third bracket in step 2",
   "method_correct": true,
-  "student_score": 7,
+  "student_score": 2,
   "max_score": {max_score},
-  "feedback": "Step 1: WRONG - starting expression differs from question. Step 2: correct method but affected by step 1 error.",
+  "feedback": "Step 1 is correct - you copied the expression accurately. Step 2 is wrong: you wrote '5x^2+2xy-xy+3y^2+y^2' but the full distribution of -(xy-3y^2)+(y^2+4xy) should give '5x^2+2xy-xy+3y^2+y^2+4xy' - you dropped the '+4xy' term from the last bracket. Step 3 carries the same error: you got '5x^2+xy+4y^2' but the correct combined form is '5x^2+5xy+4y^2' (xy coefficient should be 5, not 1).",
   "is_correct": false,
   "confidence": "high"
 }}"""
@@ -439,10 +598,11 @@ def _load_model() -> None:
     description, and :func:`grade_answer` raises
     :class:`GradingServiceUnavailable`.
 
-    The processor is pinned to ``[_MIN_PIXELS, _MAX_PIXELS]`` so every
-    incoming image is automatically resized into that band before it
-    reaches the visual encoder - this is the single largest knob for
-    per-request VRAM usage.
+    Qwen2.5-VL is loaded here for its TEXT capability only; we no longer
+    send images through its vision encoder (GLM-OCR handles OCR
+    upstream). The processor is still a full ``AutoProcessor`` so the
+    chat-template helper continues to work - we just never call
+    ``process_vision_info`` or pass ``images=`` to the processor.
     """
     global _model, _processor, _device, _load_attempted, _load_error
 
@@ -511,16 +671,11 @@ def _load_model() -> None:
                 dtype=torch.float16,
                 device_map=_device,
             )
-            _processor = AutoProcessor.from_pretrained(
-                MODEL_ID,
-                min_pixels=_MIN_PIXELS,
-                max_pixels=_MAX_PIXELS,
-            )
+            _processor = AutoProcessor.from_pretrained(MODEL_ID)
             _model.eval()
             logger.info(
-                "grading: model loaded (min_pixels=%d max_pixels=%d max_new_tokens=%d)",
-                _MIN_PIXELS,
-                _MAX_PIXELS,
+                "grading: Qwen text-grader loaded (max_new_tokens=%d, OCR handled "
+                "upstream by GLM-OCR via ocr_service)",
                 _MAX_NEW_TOKENS_PASS,
             )
             _log_vram_usage("after-load")
@@ -667,9 +822,9 @@ def _decode_image(image_bytes: bytes) -> Image.Image:
     3. Apply :func:`_preprocess_image` (grayscale → denoise → deskew →
        binarise) to improve downstream OCR accuracy.
 
-    We do **not** resize here - the processor applies its own
-    ``[_MIN_PIXELS, _MAX_PIXELS]`` smart-resize downstream, which is
-    what the visual encoder is trained against.
+    The resulting image is fed to GLM-OCR (not Qwen) - GLM-OCR handles
+    its own smart-resize internally, so we don't clamp pixel dimensions
+    here anymore.
 
     Parameters
     ----------
@@ -679,7 +834,7 @@ def _decode_image(image_bytes: bytes) -> Image.Image:
     Returns
     -------
     Image.Image
-        Preprocessed RGB image ready to pass to the model processor.
+        Preprocessed RGB image ready to pass to GLM-OCR.
 
     Raises
     ------
@@ -697,35 +852,92 @@ def _decode_image(image_bytes: bytes) -> Image.Image:
     return _preprocess_image(img)
 
 
-def _estimate_pixels_after_resize(image: Image.Image) -> int:
-    """Return the pixel count the processor will actually feed the encoder.
+def _transcribe_handwriting(
+    pil_image: Image.Image,
+    *,
+    prompt: str = _OCR_PROMPT,
+    max_new_tokens: int = _OCR_MAX_NEW_TOKENS,
+) -> str:
+    """Run GLM-OCR on a preprocessed student image and return the transcription.
 
-    Uses Qwen's own ``smart_resize`` helper when available so the
-    number reported matches what the model sees. Falls back to the
-    original image dimensions if the helper cannot be imported.
+    Delegates to :func:`app.services.ocr_service.transcribe_image` so the
+    GLM-OCR engine singleton is shared with the answer-key ingestion
+    path - we never load the OCR weights twice.
 
-    Parameters
-    ----------
-    image:
-        PIL image whose dimensions are used for the estimate.
-
-    Returns
-    -------
-    int
-        Estimated pixel count after processor smart-resize.
+    Returns an empty string on any failure (engine missing, OCR
+    exception). The caller is responsible for deciding how to react to
+    an empty transcription (typically: fail the grading call with a
+    low-confidence zero-score envelope).
     """
-    try:  # pragma: no cover - depends on qwen_vl_utils internals
-        from qwen_vl_utils.vision_process import smart_resize  # type: ignore
-
-        h, w = smart_resize(
-            image.height,
-            image.width,
-            min_pixels=_MIN_PIXELS,
-            max_pixels=_MAX_PIXELS,
-        )
-        return int(h * w)
+    try:
+        from app.services.ocr_service import transcribe_image
     except Exception:
-        return int(image.width * image.height)
+        logger.exception(
+            "grading: could not import ocr_service.transcribe_image; "
+            "cannot OCR student handwriting"
+        )
+        return ""
+
+    try:
+        return transcribe_image(
+            pil_image,
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+        )
+    except Exception:
+        logger.exception("grading: GLM-OCR transcription raised")
+        return ""
+
+
+def _retrieve_grading_context(
+    transcription: str,
+    file_id: str | None,
+    *,
+    top_k: int = _RAG_EXTRA_TOP_K,
+) -> list[str]:
+    """Fetch additional Chroma chunks to feed into the grading prompt.
+
+    The resolver already picks the matching :class:`AnswerKeyItem` for
+    the student's target question and the route layer passes that
+    item's worked solution as ``answer_key``. This helper adds an
+    *optional* second retrieval hop: embed the OCR'd transcription
+    with ``bge-m3`` and pull the top-K nearest-neighbour answer-key
+    chunks from the same ``file_id``. Useful when the student's work
+    looks structurally similar to other solved problems and we want
+    the LLM to spot cross-question hints.
+
+    No-op when ``top_k <= 0`` (the default) or when retrieval raises;
+    we never let a RAG failure break grading.
+    """
+    if top_k <= 0 or not transcription.strip():
+        return []
+
+    try:
+        from app.services.chroma_service import search_documents
+        from app.services.embedding_service import get_embedding
+    except Exception:
+        logger.exception("grading: RAG dependencies unavailable; skipping retrieval")
+        return []
+
+    try:
+        query = transcription[:2000]  # bge-m3 is happier with bounded inputs
+        embedding = get_embedding(query)
+        where = {"file_id": str(file_id)} if file_id else None
+        result = search_documents(
+            query_embedding=embedding,
+            top_k=top_k,
+            where=where,
+        )
+        docs_outer = result.get("documents") or []
+        docs = docs_outer[0] if docs_outer else []
+        return [str(d) for d in docs if d]
+    except Exception:
+        logger.exception(
+            "grading: RAG retrieval failed (top_k=%d, file_id=%s); proceeding without extras",
+            top_k,
+            file_id,
+        )
+        return []
 
 
 # --------------------------------------------------------------------- parsing
@@ -1098,22 +1310,83 @@ def _repair_final_answer_match(
     data: dict[str, Any],
     expected_final_answer: str | None,
     max_score: int,
+    *,
+    transcription: str | None = None,
+    question: str | None = None,
+    question_label: str | None = None,
 ) -> None:
-    """Safety net: if any extracted step matches the expected final answer,
-    upgrade the **entire** response to full-marks / all-correct state.
+    """Safety net: if the extracted final step matches the expected final
+    answer AND the answer also appears in the raw OCR transcription, upgrade
+    the **entire** response to full-marks / all-correct state.
 
     Rationale
     ---------
 
     When the student writes the correct final answer on their paper,
     they have reached the correct result. Intermediate-step
-    transcription noise (e.g. the VLM reads cursive "3" as "8") is the
+    transcription noise (e.g. GLM-OCR reads cursive "3" as "8") is the
     grader's problem, not the student's. A correct final answer is
     strong evidence the student's math was valid; the per-step flags
     the VLM produced against its own (noisy) transcription cannot be
     trusted in that case.
 
-    We therefore normalise the **whole** response so no field
+    Cancelling-errors failure mode
+    ------------------------------
+
+    The safety net cannot naively trust *any* final-answer match:
+    students sometimes make two (or more) real arithmetic mistakes
+    that happen to cancel out, producing the correct final answer via
+    genuinely wrong intermediate work. Crediting full marks there is
+    pedagogically wrong -- the student did not do the math correctly,
+    Qwen's per-step ``is_correct=false`` flags are accurate, and the
+    mismatched intermediate steps are real errors rather than OCR
+    noise.
+
+    Two additional guards below distinguish "OCR noise cancelling out"
+    from "real student errors cancelling out":
+
+    - **Step-1 copy guard**: step 1 is a straight copy from the printed
+      question. If the student's step 1 does not match the expected
+      starting expression, the student made a real copy error -- not
+      OCR noise -- so we must not upgrade.
+    - **Transcription-confirmed wrong step guard**: if any step Qwen
+      flagged ``is_correct=false`` has a ``student_wrote`` that is
+      verbatim present in the raw GLM-OCR transcription AND genuinely
+      differs from ``expected`` under normalisation, then the VLM's
+      flag is reliable (the student actually wrote that wrong line on
+      the page), so the upgrade is suppressed.
+
+    Guards (in order)
+    -----------------
+
+    1. ``GRADING_FINAL_ANSWER_SAFETY_NET=0`` - master off switch; no-op.
+    2. ``expected_final_answer`` is falsy - no target to match against.
+    3. ``GRADING_SAFETY_NET_REQUIRE_LAST_STEP=1`` (default) - we only
+       accept a match that lands on the LAST non-empty extracted step.
+       This prevents crediting students who wrote the correct
+       intermediate form but then finished with a wrong final line.
+       Set the env var to 0 to restore the legacy "match anywhere"
+       behaviour for cases where the VLM drops the trailing line.
+    4. ``GRADING_SAFETY_NET_VERIFY_TRANSCRIPTION=1`` (default) - the
+       expected answer must also appear (whitespace-insensitive) in the
+       raw GLM-OCR transcription. Defeats the "VLM leaked the answer
+       key from its prompt into student_wrote" failure mode: if OCR
+       never saw the string, Qwen hallucinated it, and the match
+       cannot be trusted.
+    5. **Step-1 copy guard** - when ``question`` is supplied and step 1's
+       ``student_wrote`` (after label-stripping) does not match the
+       starting expression, skip the upgrade. This suppresses the
+       cancelling-errors false positive: a mismatched step 1 is a real
+       student copy error, not OCR noise.
+    6. **Transcription-confirmed wrong step guard** - when
+       ``transcription`` is supplied, any step flagged
+       ``is_correct=false`` whose ``student_wrote`` is verbatim
+       present in the transcription AND differs from its ``expected``
+       under normalisation is treated as a confirmed real student
+       error. The upgrade is skipped because Qwen's per-step verdicts
+       are trustworthy in that case.
+
+    When all guards pass we normalise the **whole** response so no field
     contradicts another:
 
     - Top-level: ``student_score -> max_score``; ``is_correct -> True``;
@@ -1128,18 +1401,6 @@ def _repair_final_answer_match(
       from the now-all-correct step list (it will read ``N/N steps
       correct``).
 
-    We check **all** extracted steps (not just the last) because the
-    VLM sometimes drops the trailing line or collapses it into the
-    previous step; as long as the expected final answer appears
-    somewhere in the student's transcribed work, credit it.
-
-    No-op when:
-
-    - ``expected_final_answer`` is falsy (manual ``/submit`` path).
-    - No extracted step matches the expected final answer. In that
-      case the per-step flags the VLM produced are preserved so the
-      caller sees genuine errors.
-
     Parameters
     ----------
     data:
@@ -1148,7 +1409,26 @@ def _repair_final_answer_match(
         Expected final answer string (e.g. ``"2x^2 + xy + 4y^2"``).
     max_score:
         Maximum score for score clamping.
+    transcription:
+        Raw GLM-OCR transcription of the student's page. Used for the
+        hallucination cross-check AND the transcription-confirmed
+        wrong step guard. Pass ``None`` to skip both checks (legacy
+        behaviour); the hallucination check is also gated on the
+        ``GRADING_SAFETY_NET_VERIFY_TRANSCRIPTION`` env var.
+    question:
+        Expected starting expression (the original problem text). Used
+        by the step-1 copy guard to detect real student copy errors
+        that would otherwise be masked by a coincidentally correct
+        final answer. Pass ``None`` to skip the guard (manual
+        ``/submit`` path).
+    question_label:
+        Canonical question label (e.g. ``"0003"``) so the step-1 guard
+        can strip ``"0003."`` / ``"Q3"`` / ``"(3)"`` prefixes from
+        ``student_wrote`` before comparing against ``question``.
     """
+    if not _GRADING_SAFETY_NET_ENABLED:
+        return
+
     if not expected_final_answer:
         return
 
@@ -1161,15 +1441,145 @@ def _repair_final_answer_match(
         return
 
     match_idx: int | None = None
-    for i, step in enumerate(steps):
-        if not isinstance(step, dict):
-            continue
-        if _normalize_final_answer(step.get("student_wrote")) == expected_norm:
-            match_idx = i
-            break
+    if _GRADING_SAFETY_NET_REQUIRE_LAST_STEP:
+        # Walk from the end and find the last step with non-empty
+        # ``student_wrote``; only accept a match at that position so we
+        # never credit a correct intermediate line while the student's
+        # real final line is wrong.
+        for i in range(len(steps) - 1, -1, -1):
+            step = steps[i]
+            if not isinstance(step, dict):
+                continue
+            if not str(step.get("student_wrote") or "").strip():
+                continue
+            if _normalize_final_answer(step.get("student_wrote")) == expected_norm:
+                match_idx = i
+            break  # either way, the last non-empty step is decisive
+    else:
+        # Legacy "match anywhere" behaviour. Kept for ops who know their
+        # VLM tends to drop the trailing line and prefer false positives
+        # to false negatives.
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            if _normalize_final_answer(step.get("student_wrote")) == expected_norm:
+                match_idx = i
+                break
 
     if match_idx is None:
         return  # student never wrote the expected final answer; trust VLM flags.
+
+    # Anti-hallucination: if the expected answer isn't actually present
+    # in what GLM-OCR read off the page, Qwen is almost certainly copying
+    # the expected string from the answer_key block in its own prompt.
+    # Refuse the upgrade in that case so Qwen's per-step verdicts stand.
+    if (
+        _GRADING_SAFETY_NET_VERIFY_TRANSCRIPTION
+        and transcription is not None
+    ):
+        transcription_norm = _math_normalize(transcription)
+        if expected_norm not in transcription_norm:
+            logger.warning(
+                "grading: final-answer safety net SKIPPED - expected %r "
+                "matched extracted_steps[%d].student_wrote but NOT present "
+                "in raw GLM-OCR transcription (len=%d). Likely VLM "
+                "hallucination; trusting per-step flags.",
+                expected_final_answer,
+                match_idx,
+                len(transcription_norm),
+            )
+            return
+
+    # Guard: if step 1 doesn't match the starting expression, the
+    # student made a real copy error - do not credit full marks even
+    # if the final answer accidentally matches (two errors cancelling
+    # out). Step 1 is a straight copy from the printed question, so a
+    # mismatch there is never explainable as OCR transcription noise.
+    if question:
+        student_raw = str(steps[0].get("student_wrote") or "") if isinstance(steps[0], dict) else ""
+        if question_label:
+            variants = _label_prefix_variants(str(question_label))
+            student_clean = _strip_leading_label(student_raw, variants)
+        else:
+            student_clean = student_raw
+        student_norm = _math_normalize(student_clean)
+        question_norm = _math_normalize(question)
+        if (
+            student_norm
+            and question_norm
+            and student_norm != question_norm
+            and student_norm not in question_norm
+        ):
+            logger.warning(
+                "grading: final-answer safety net SKIPPED - step 1 "
+                "student_wrote=%r does not match starting expression=%r "
+                "(student made a real copy error, not OCR noise; "
+                "cancelling-error false positive suppressed).",
+                student_clean[:80],
+                question[:80],
+            )
+            return
+
+    # Guard (Qwen-independent): even if ``extracted_steps[0].student_wrote``
+    # matches the question, Qwen is known to silently rewrite step 1 so it
+    # matches the expected starting expression when the student actually
+    # copied it wrong. The raw GLM-OCR transcription is Qwen-independent:
+    # if the expected starting expression does NOT appear (normalised) in
+    # the transcription, the student wrote something different on the
+    # page regardless of what Qwen reported, so the safety net must not
+    # fire. This is the bulletproof backstop against Qwen-rewrite
+    # cancelling-error cases like Q 0003 ("+y^2" vs "-y^2" sign flip).
+    if question and transcription:
+        question_norm = _math_normalize(question)
+        transcription_norm = _math_normalize(transcription)
+        if (
+            question_norm
+            and transcription_norm
+            and question_norm not in transcription_norm
+        ):
+            logger.warning(
+                "grading: final-answer safety net SKIPPED - expected "
+                "starting expression %r does NOT appear in raw GLM-OCR "
+                "transcription. The student copied the question "
+                "incorrectly (real copy error). Qwen may have silently "
+                "rewritten step 1 to match the question; the final "
+                "answer match is therefore a cancelling-errors artefact "
+                "and must not be credited.",
+                question[:120],
+            )
+            return
+
+    # Guard: if any step that Qwen flagged ``is_correct=false`` has a
+    # ``student_wrote`` value that exists verbatim in the raw GLM-OCR
+    # transcription AND differs from its ``expected`` value under
+    # ``_math_normalize``, treat that as a confirmed real student error
+    # (not OCR noise) and skip the upgrade. Presence in the
+    # transcription confirms the VLM didn't hallucinate the wrong line;
+    # the mismatch against ``expected`` confirms it's genuinely wrong
+    # math rather than an equivalent alternate form.
+    if transcription:
+        transcription_norm = _math_normalize(transcription)
+        for step in steps:
+            if not isinstance(step, dict) or step.get("is_correct", True):
+                continue
+            wrote_norm = _math_normalize(step.get("student_wrote") or "")
+            expected_norm_step = _math_normalize(step.get("expected") or "")
+            if (
+                wrote_norm
+                and expected_norm_step
+                and wrote_norm != expected_norm_step
+                and wrote_norm in transcription_norm
+            ):
+                logger.warning(
+                    "grading: final-answer safety net SKIPPED - step %s "
+                    "student_wrote=%r is confirmed in transcription but "
+                    "differs from expected=%r (real student error, not "
+                    "OCR noise).",
+                    step.get("step_number"),
+                    str(step.get("student_wrote") or "")[:80],
+                    str(step.get("expected") or "")[:80],
+                )
+                return
 
     current_score = _clamp_score(data.get("student_score", 0), max_score)
     was_score = current_score
@@ -1258,29 +1668,432 @@ def _repair_final_answer_match(
         )
 
 
+def _enforce_step1_starting_expression(
+    data: dict[str, Any],
+    question: str | None,
+    question_label: str | None = None,
+    transcription: str | None = None,
+) -> None:
+    """Force step 1 ``is_correct=false`` when it differs from the question.
+
+    Rationale
+    ---------
+
+    The VLM is known to "helpfully" rewrite step 1 so it matches the
+    question-text when the student copied the starting expression
+    incorrectly. A classic failure mode is a sign flip ("+y^2" vs
+    "-y^2") or a coefficient copy error - the student's subsequent
+    work flows logically from their own (wrong) starting expression,
+    and Qwen credits everything as correct because the alternate
+    reading "makes the math work". We already removed the
+    prompt-level rule that encouraged this, but a Python-side guard
+    here is a deterministic backstop that cannot be negotiated away
+    by the LLM.
+
+    The checks (either is sufficient to force step 1 wrong):
+
+    1. **Qwen-reported check**: take the first extracted step's
+       ``student_wrote`` field and compare (after label-stripping and
+       ``_math_normalize``) against ``question``. If they differ,
+       force step 1 wrong. This catches cases where Qwen faithfully
+       reports what the student wrote.
+    2. **Transcription check** (Qwen-independent): if the expected
+       ``question`` does NOT appear (normalised) in the raw GLM-OCR
+       ``transcription``, the student wrote something different on
+       the page regardless of what Qwen reported in
+       ``extracted_steps[0].student_wrote``. Forces step 1 wrong even
+       when Qwen silently rewrote the student's copy to match the
+       question - the canonical Q 0003 cancelling-errors case.
+
+    No-op when:
+
+    - ``question`` is falsy (manual ``/submit`` path that didn't pass
+      the question text).
+    - ``extracted_steps`` is missing or empty.
+    - Step 1's ``student_wrote`` already matches the question AND the
+      expected question appears verbatim in the transcription (or no
+      transcription was supplied).
+    - Step 1 was already flagged ``is_correct=false`` (nothing to
+      override; the VLM agreed with us).
+
+    Parameters
+    ----------
+    data:
+        Parsed grading response dict, mutated in place.
+    question:
+        Expected starting expression (the original problem text). When
+        the question is a sentence like "Simplify (3x^2+2xy-y^2)-..."
+        we still compare after normalisation - any leading prose will
+        simply never equal ``student_wrote``, in which case we skip
+        the override conservatively (we don't want false positives).
+    question_label:
+        Canonical question label so we can strip "0003." / "Q3" /
+        "(3)" prefixes from ``student_wrote`` before comparing.
+    transcription:
+        Raw GLM-OCR transcription of the student's page. Used for the
+        Qwen-independent substring check that defeats the "Qwen
+        silently rewrote step 1" failure mode. Pass ``None`` to skip
+        the transcription check (legacy behaviour).
+    """
+    if not question:
+        return
+
+    steps = data.get("extracted_steps")
+    if not isinstance(steps, list) or not steps:
+        return
+
+    first = steps[0]
+    if not isinstance(first, dict):
+        return
+
+    if not first.get("is_correct", False):
+        return  # already flagged wrong - nothing to override
+
+    student_raw = str(first.get("student_wrote") or "")
+    if question_label:
+        variants = _label_prefix_variants(str(question_label))
+        student_clean = _strip_leading_label(student_raw, variants)
+    else:
+        student_clean = student_raw
+
+    student_norm = _math_normalize(student_clean)
+    question_norm = _math_normalize(question)
+
+    if not question_norm:
+        return
+
+    # Check 2 (Qwen-independent, runs first): is the expected starting
+    # expression actually on the page according to raw GLM-OCR? If not,
+    # the student copied it wrong regardless of what Qwen reported for
+    # ``student_wrote``. This is the ONLY guard that survives Qwen
+    # silently rewriting step 1 to match the question.
+    transcription_hit = True
+    if transcription:
+        transcription_norm = _math_normalize(transcription)
+        if transcription_norm and question_norm not in transcription_norm:
+            transcription_hit = False
+            logger.warning(
+                "grading: step 1 transcription check - expected question %r "
+                "NOT present in raw GLM-OCR transcription. Qwen may have "
+                "rewritten step 1 to match; forcing is_correct=false.",
+                question[:120],
+            )
+
+    if transcription_hit:
+        # Check 1 (Qwen-reported): fall back to comparing Qwen's
+        # reported student_wrote against the question. Only meaningful
+        # when we haven't already decided to flip via the transcription
+        # check.
+        if not student_norm:
+            return
+        # When the question is a bare expression (the common answer-key
+        # case), we expect exact equality. When the question is a full
+        # sentence ("Simplify ... = ?"), equality will fail naturally -
+        # skip so we don't create false positives against sentence prose.
+        # Heuristic: if the question contains the student's normalised
+        # text as a substring we treat it as "question contains an
+        # embedded expression" and require that substring match; else
+        # require full equality.
+        if student_norm == question_norm:
+            return
+        if student_norm in question_norm:
+            return
+
+    # If the question *contains* the expected expression and the
+    # student's differs from the embedded one, we still flag. This
+    # catches "Simplify (3x^2+2xy-y^2)-(x^2-5xy-4y^2)" vs the
+    # student's "+y^2" copy error.
+    logger.warning(
+        "grading: step 1 character mismatch - student_wrote=%r does not "
+        "match question=%r (transcription_hit=%s); forcing is_correct=false "
+        "(was true)",
+        student_clean,
+        question,
+        transcription_hit,
+    )
+    first["is_correct"] = False
+    existing_err = str(first.get("error") or "").strip()
+    if transcription_hit:
+        new_err = (
+            f"student wrote {student_clean!r} but the question starts with "
+            f"{question!r}; the student copied the starting expression "
+            f"incorrectly (check signs, coefficients, and exponents)"
+        )
+    else:
+        new_err = (
+            f"the expected starting expression {question!r} was not "
+            f"found in the raw OCR reading of this page; the student "
+            f"copied the question incorrectly (check signs, "
+            f"coefficients, and exponents)"
+        )
+    # Preserve any prior error by appending, but put our own first so the
+    # root cause reads naturally.
+    first["error"] = (
+        new_err if not existing_err else f"{new_err}. Prior note: {existing_err}"
+    )
+
+
+# Patterns used by the "Qwen self-contradiction" reconciler below. Both are
+# intentionally permissive regexes that match the canonical "everything OK"
+# narrative Qwen emits when it *thinks* the student got the question right.
+# Keep them anchored to phrase fragments that are NOT ambiguous at the
+# sentence level - we do not want to match e.g. "step 3 is correct" (which
+# would be a false positive that silently upgrades partially-correct work).
+_QWEN_SAYS_ALL_CORRECT_RE = re.compile(
+    r"\ball\s+(?:the\s+)?steps?\s+(?:are\s+)?correct\b"
+    r"|\ball\s+correct\b"
+    r"|\bno\s+errors?\s+(?:were\s+)?(?:detected|found|present)\b"
+    r"|\bcorrectly\s+(?:expanded|simplified|solved|computed)\b",
+    re.IGNORECASE,
+)
+
+_QWEN_EMPTY_SUMMARY_RE = re.compile(
+    r"^\s*(?:none|null|no\s+errors?(?:\s+detected|\s+found)?|n/?a)\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _qwen_says_all_correct(data: dict[str, Any]) -> bool:
+    """True when Qwen's top-level narrative clearly claims no step errors.
+
+    Looks at ``feedback`` (the detailed sentence) and ``error_summary``
+    (the short one-liner) together. Both must be consistent with
+    "all correct" for this to return True - a feedback that says
+    "all steps correct" while error_summary specifically names a
+    wrong step would NOT match.
+    """
+    feedback = str(data.get("feedback") or "")
+    summary = str(data.get("error_summary") or "")
+
+    feedback_says_correct = bool(_QWEN_SAYS_ALL_CORRECT_RE.search(feedback[:500]))
+    summary_says_no_errors = (
+        not summary.strip() or bool(_QWEN_EMPTY_SUMMARY_RE.match(summary))
+    )
+    return feedback_says_correct and summary_says_no_errors
+
+
+def _reconcile_qwen_self_contradiction(
+    data: dict[str, Any],
+    *,
+    question: str | None,
+    expected_final_answer: str | None,
+    transcription: str | None,
+) -> None:
+    """Repair "feedback says all correct but per-step flags disagree".
+
+    Qwen's JSON output is occasionally internally inconsistent: it
+    emits one or more ``extracted_steps[].is_correct=false`` flags
+    while the top-level ``feedback`` and ``error_summary`` describe
+    the work as entirely correct. Empirically the long-form narrative
+    text is more reliable than the discrete flags in these cases
+    (Qwen's flag generator hallucinates errors that its prose describer
+    does not see). We therefore trust the narrative - but only when
+    two **Qwen-independent** sanity signals agree with it:
+
+    1. The expected printed ``question`` appears verbatim (normalised)
+       in the raw GLM-OCR ``transcription`` - proof that the student
+       really did copy the starting expression correctly on the page.
+    2. The ``expected_final_answer`` appears verbatim (normalised) in
+       the raw GLM-OCR ``transcription`` - proof that the student
+       really did reach the right answer on the page.
+
+    When BOTH hold and Qwen's narrative says "all correct", we flip
+    every per-step ``is_correct=false`` back to ``true`` so the
+    response matches its own narrative. When either signal fails
+    we leave the flags alone and let the stricter downstream guards
+    (``_enforce_step1_starting_expression``, ``_validate_score``)
+    have the final word - this is exactly the case that distinguishes
+    Q 0002 (student really correct, safe to trust Qwen's narrative)
+    from Q 0003 (real copy error on the page, narrative is itself
+    wrong, must not trust it).
+    """
+    if not _qwen_says_all_correct(data):
+        return
+
+    steps = data.get("extracted_steps")
+    if not isinstance(steps, list) or not steps:
+        return
+
+    wrong_steps = [
+        s for s in steps if isinstance(s, dict) and not s.get("is_correct", True)
+    ]
+    if not wrong_steps:
+        return  # already internally consistent; nothing to reconcile
+
+    # Sanity signal 1: the printed question must appear on the page.
+    if question and transcription:
+        question_norm = _math_normalize(question)
+        transcription_norm = _math_normalize(transcription)
+        if question_norm and question_norm not in transcription_norm:
+            return
+    elif not (question and transcription):
+        # Without either signal we cannot safely reconcile - defer to
+        # the stricter per-step policy.
+        return
+
+    # Sanity signal 2: the expected final answer must appear on the page.
+    if expected_final_answer and transcription:
+        answer_norm = _normalize_final_answer(expected_final_answer)
+        transcription_norm = _math_normalize(transcription)
+        if answer_norm and answer_norm not in transcription_norm:
+            return
+    elif not (expected_final_answer and transcription):
+        return
+
+    # Both sanity signals pass. Flip all wrong step flags to match
+    # Qwen's narrative. Log an audit entry for each flip so we can
+    # trace this decision later.
+    flipped_audit: list[dict[str, Any]] = []
+    for step in wrong_steps:
+        flipped_audit.append(
+            {
+                "step_number": step.get("step_number"),
+                "student_wrote": str(step.get("student_wrote") or "")[:120],
+                "original_error": step.get("error"),
+            }
+        )
+        step["is_correct"] = True
+        step["error"] = None
+
+    data["first_error_step"] = None
+    logger.warning(
+        "grading: Qwen self-contradiction repaired - top-level feedback "
+        "claims all steps correct AND transcription confirms the student "
+        "wrote the correct question + final answer on the page, but %d "
+        "per-step flag(s) were marked wrong. Flipped those steps to "
+        "correct to match Qwen's own narrative. flipped=%r",
+        len(flipped_audit),
+        flipped_audit,
+    )
+
+
+def _reconcile_top_level_feedback_with_steps(
+    data: dict[str, Any],
+    expected_final_answer: str | None,
+) -> None:
+    """Rewrite ``error_summary`` and ``feedback`` to match the step verdict.
+
+    Runs last, after ``_validate_score`` has settled ``is_correct`` and
+    ``first_error_step`` from the per-step list. Guarantees the
+    user-visible text fields never claim "all correct" while the score
+    reflects errors, and vice versa. The score + per-step list are
+    always the source of truth at this stage; only the two prose
+    fields are adjusted.
+
+    Two cases:
+
+    - **All steps correct**: clear ``error_summary`` and, if the
+      feedback narrative does not already read as "all correct",
+      replace it with a clean one-sentence statement so the student
+      sees a coherent "well done" message rather than whatever
+      half-finished text Qwen emitted.
+    - **At least one wrong step**: if the top-level narrative still
+      claims "all correct" (canonical Qwen self-contradiction), rebuild
+      both ``feedback`` and ``error_summary`` from the wrong steps'
+      ``error`` fields so the student sees what actually went wrong.
+      Narratives that already acknowledge errors (as for Q 0004) are
+      left unchanged.
+    """
+    steps = data.get("extracted_steps") or []
+    wrong_steps = [
+        s for s in steps if isinstance(s, dict) and not s.get("is_correct", True)
+    ]
+
+    feedback = str(data.get("feedback") or "")
+
+    if not wrong_steps:
+        # All steps now correct. Make the prose consistent.
+        if not _QWEN_SAYS_ALL_CORRECT_RE.search(feedback[:500]):
+            original = feedback
+            tail = (
+                f" ({expected_final_answer})" if expected_final_answer else ""
+            )
+            data["feedback"] = (
+                f"All steps are correct. The student reached the correct "
+                f"final answer{tail}."
+            )
+            logger.info(
+                "grading: reconciled feedback for all-correct case "
+                "(was=%r now=%r)",
+                original[:120],
+                str(data["feedback"])[:120],
+            )
+        data["error_summary"] = None
+        data["first_error_step"] = None
+        return
+
+    # Wrong steps present. If Qwen's narrative still claims everything
+    # is correct, regenerate both text fields from the per-step errors.
+    if _qwen_says_all_correct(data):
+        parts: list[str] = []
+        for ws in wrong_steps:
+            sn = ws.get("step_number")
+            err = str(ws.get("error") or "").strip()
+            if err:
+                parts.append(f"Step {sn}: {err}" if sn is not None else err)
+
+        if parts:
+            new_feedback = " ".join(parts)[:2000]
+            new_summary = parts[0][:400]
+        else:
+            new_feedback = (
+                f"{len(wrong_steps)} step(s) contain errors; please "
+                f"review the per-step breakdown."
+            )
+            new_summary = new_feedback
+
+        logger.warning(
+            "grading: reconciled contradictory feedback - Qwen claimed "
+            "all correct but %d step(s) are flagged wrong. "
+            "Regenerated feedback and error_summary from step-level errors.",
+            len(wrong_steps),
+        )
+        data["feedback"] = new_feedback
+        data["error_summary"] = new_summary
+
+
 def _validate_score(data: dict[str, Any], max_score: int) -> dict[str, Any]:
-    """Apply score-related sanity checks to ``data`` in place.
+    """Recompute ``student_score`` deterministically from the step list.
 
-    Three guarantees for the caller:
+    Policy
+    ------
 
-    - ``student_score`` is clamped to ``[0, max_score]``.
-    - If the model returned ``student_score=0`` but ``extracted_steps``
-      shows a **majority** of steps correct (step_ratio >= 0.5), we
-      override with a step-proportional estimate and log a WARNING. We
-      require step_ratio >= 0.5 to avoid awarding partial credit when
-      the student merely copied the opening expression correctly while
-      getting every subsequent step wrong.
-    - ``first_error_step`` is back-filled from the first incorrect step
-      when the model forgot to emit it.
-    - ``score_breakdown`` is populated with ``"X/Y steps correct"`` so
-      the response model always has a value.
+    Qwen is good at judging step-level correctness (``extracted_steps[].
+    is_correct``) but historically unreliable at converting that judgement
+    into a numeric score: we've seen it output the *count* of correct
+    steps as the score (e.g. ``3`` when 3/3 steps are correct and
+    ``max_score`` is 5 or 10), output ``max_score`` despite flagging
+    intermediate errors, or output ``0`` despite flagging everything
+    correct. Instead of reasoning case-by-case about which Qwen mistake
+    we're seeing, the Python side simply **recomputes** the score from
+    the step list:
+
+        student_score = round(correct_steps / total_steps * max_score)
+
+    with one safety override: if any step is wrong and rounding would
+    produce ``max_score``, we cap at ``max_score - 1`` so the numeric
+    score can never lie about "all steps correct" when they're not.
+
+    Guarantees
+    ----------
+
+    - ``student_score`` is always in ``[0, max_score]``.
+    - ``is_correct`` equals ``(total > 0 and wrong == 0)``. The per-step
+      list is authoritative; any stale top-level flag Qwen produced is
+      overwritten.
+    - When all steps are correct, ``student_score == max_score``.
+    - When any step is wrong, ``student_score < max_score``.
+    - ``first_error_step`` is back-filled from the first
+      ``is_correct=false`` step when the model forgot to emit it; or
+      cleared to ``None`` when every step is correct.
+    - ``score_breakdown`` is populated with ``"X/Y steps correct"``.
 
     Parameters
     ----------
     data:
         Parsed grading response dict, mutated in place.
     max_score:
-        Maximum score for clamping and proportional calculation.
+        Maximum score used for scaling.
 
     Returns
     -------
@@ -1295,31 +2108,68 @@ def _validate_score(data: dict[str, Any], max_score: int) -> dict[str, Any]:
     correct = sum(
         1 for s in steps if isinstance(s, dict) and s.get("is_correct", False)
     )
+    wrong = total - correct
 
-    step_ratio: float = (correct / total) if total > 0 else 0.0
-    step_score = round(step_ratio * max_score)
-
-    current_score = _clamp_score(data.get("student_score", 0), max_score)
-
-    # Override: model said 0 but a majority of its own steps are correct.
-    # Requiring step_ratio >= 0.5 guards against the case where the student
-    # only copied the starting expression (step 1 correct) and got everything
-    # else wrong - that should not flip the score from 0.
-    if current_score == 0 and correct > 0 and step_ratio >= 0.5:
+    # --- Reconcile top-level ``is_correct`` with the per-step verdict ----
+    steps_all_correct = (total > 0 and wrong == 0)
+    was_is_correct = bool(data.get("is_correct", False))
+    data["is_correct"] = steps_all_correct
+    if was_is_correct and not steps_all_correct:
         logger.warning(
-            "grading: score=0 override correct=%d/%d step_ratio=%.2f new_score=%d",
+            "grading: top-level is_correct=true but %d/%d steps wrong; "
+            "forcing is_correct=false",
+            wrong,
+            total,
+        )
+    elif not was_is_correct and steps_all_correct:
+        logger.info(
+            "grading: top-level is_correct=false but all %d steps correct; "
+            "forcing is_correct=true",
+            total,
+        )
+
+    # --- Deterministic score computation ---------------------------------
+    reported_score = _clamp_score(data.get("student_score", 0), max_score)
+
+    if total == 0:
+        # No steps at all (degenerate response). Fall back to whatever
+        # Qwen reported, clamped, but mark the response as wrong so a
+        # human reviewer sees it - "no steps extracted" is always a
+        # red flag, not a scoring event.
+        computed_score = reported_score
+        data["is_correct"] = False
+        logger.warning(
+            "grading: extracted_steps empty; keeping clamped reported_score=%d",
+            reported_score,
+        )
+    else:
+        ratio = correct / total
+        computed_score = round(ratio * max_score)
+        # When any step is wrong, the student cannot have full marks
+        # regardless of rounding. This handles e.g. 9/10 correct with
+        # max_score=5 -> round(4.5)=5, which would contradict the
+        # flagged wrong step.
+        if not steps_all_correct and computed_score >= max_score:
+            computed_score = max(0, max_score - 1)
+
+    data["student_score"] = computed_score
+
+    if computed_score != reported_score:
+        logger.info(
+            "grading: student_score recomputed %d -> %d (steps %d/%d correct, "
+            "max_score=%d, is_correct=%s)",
+            reported_score,
+            computed_score,
             correct,
             total,
-            step_ratio,
-            step_score,
+            max_score,
+            data["is_correct"],
         )
-        current_score = step_score
 
-    data["student_score"] = current_score
-
-    # Back-fill first_error_step if the model returned null despite
-    # having at least one is_correct=false step.
-    if data.get("first_error_step") is None:
+    # --- Back-fill first_error_step --------------------------------------
+    if wrong == 0:
+        data["first_error_step"] = None
+    elif data.get("first_error_step") is None:
         for s in steps:
             if not isinstance(s, dict):
                 continue
@@ -1443,7 +2293,7 @@ def _normalize_confidence(value: Any) -> str:
 
 
 def _build_messages(
-    pil_image: Image.Image,
+    transcription: str,
     question: str,
     answer_key: str,
     max_score: int,
@@ -1452,12 +2302,13 @@ def _build_messages(
     strict_retry: bool,
     question_label: str | None = None,
     other_questions_on_page: list[str] | None = None,
+    retrieval_context: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build the Qwen2.5-VL chat-template messages for one grading call.
+    """Build the Qwen chat-template messages for one grading call.
 
-    The conversation is split into a system message (role definition)
-    and a multi-modal user message carrying the PIL image plus the
-    step-by-step grading instructions.
+    Text-only: the student's handwriting has already been transcribed
+    by GLM-OCR upstream, so this builds a plain text prompt with the
+    transcription inlined between sentinel markers.
 
     ``question_label`` is the canonical label of the item being graded
     (e.g. ``"0003"``) when known - typically populated by
@@ -1477,8 +2328,10 @@ def _build_messages(
 
     Parameters
     ----------
-    pil_image:
-        Student's handwritten answer image.
+    transcription:
+        GLM-OCR output of the student's handwritten page, one line per
+        physical line. Whitespace-only lines are tolerated but the
+        grader will be told to ignore them.
     question:
         Original question text.
     answer_key:
@@ -1493,6 +2346,10 @@ def _build_messages(
         Canonical question label when known, else ``None``.
     other_questions_on_page:
         Other question labels visible on the same page, else ``None``.
+    retrieval_context:
+        Optional extra RAG chunks (similar problems pulled from Chroma)
+        to inline as reference material. Empty or ``None`` disables the
+        block entirely.
 
     Returns
     -------
@@ -1550,25 +2407,44 @@ def _build_messages(
     if label_hint:
         label_hint = label_hint + "\n"
 
+    # Build the optional retrieval block. Kept blank when no extra
+    # chunks were supplied so the prompt stays tight on the common path.
+    retrieval_block = ""
+    if retrieval_context:
+        cleaned_chunks = [c.strip() for c in retrieval_context if c and c.strip()]
+        if cleaned_chunks:
+            joined = "\n---\n".join(cleaned_chunks)
+            retrieval_block = (
+                "Additional reference material retrieved from the answer-key "
+                "collection (similar problems - use for context only, do NOT "
+                "grade against these):\n"
+                f"<<<RAG_CONTEXT_BEGIN\n{joined}\nRAG_CONTEXT_END>>>\n"
+            )
+
+    # Guard against degenerate transcription (empty string etc.) so the
+    # prompt still looks coherent and the grader doesn't see the sentinel
+    # markers wrapping nothing.
+    body_transcription = (transcription or "").strip() or (
+        "(GLM-OCR returned no text - the page may be blank, illegible, "
+        "or the OCR engine failed. Emit a single extracted_steps entry "
+        'explaining that the transcription was empty.)'
+    )
+
     user_prompt = _USER_PROMPT_TEMPLATE.format(
+        transcription=body_transcription,
         question=question,
         answer_key=answer_key,
         max_score=max_score,
         subject=subject,
         label_hint=label_hint,
+        retrieval_block=retrieval_block,
     )
     if strict_retry:
         user_prompt = user_prompt + _STRICT_RETRY_SUFFIX
 
     return [
         {"role": "system", "content": _SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": pil_image},
-                {"type": "text", "text": user_prompt},
-            ],
-        },
+        {"role": "user", "content": user_prompt},
     ]
 
 
@@ -1576,9 +2452,8 @@ def _run_generation(
     messages: list[dict[str, Any]],
     *,
     max_new_tokens: int = _MAX_NEW_TOKENS_PASS,
-    processor: Any = None,
 ) -> str:
-    """Run one ``model.generate`` pass and return the decoded string.
+    """Run one Qwen ``model.generate`` pass on TEXT-only messages.
 
     Must be called with :data:`_generate_lock` held so two concurrent
     grading requests do not trample each other on the shared GPU.
@@ -1589,20 +2464,20 @@ def _run_generation(
     tighter value (e.g. 128) for short-form passes like question
     identification.
 
-    ``processor`` overrides the global ``_processor`` singleton for
-    this call only - used by the high-resolution retry path in
-    :func:`_grade_sync` where a temporary processor with a larger
-    ``max_pixels`` is created without mutating the global state.
+    This function intentionally does NOT call
+    ``qwen_vl_utils.process_vision_info`` or pass ``images=`` /
+    ``videos=`` into the processor - image understanding is now done
+    upstream by GLM-OCR in :mod:`app.services.ocr_service` and the
+    transcription is embedded inside the prompt text.
 
     Parameters
     ----------
     messages:
-        Chat-template message list.
+        Chat-template message list. Every message's ``content`` must
+        be a plain string (no image/video content blocks); the caller
+        is responsible for inlining any transcription into the text.
     max_new_tokens:
         Token budget for this generation pass.
-    processor:
-        Optional processor override. Defaults to the module-level
-        ``_processor`` singleton when ``None``.
 
     Returns
     -------
@@ -1622,18 +2497,12 @@ def _run_generation(
         )
 
     import torch
-    from qwen_vl_utils import process_vision_info
 
-    active_proc = processor if processor is not None else _processor
-
-    text = active_proc.apply_chat_template(
+    text = _processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = active_proc(
+    inputs = _processor(
         text=[text],
-        images=image_inputs,
-        videos=video_inputs,
         padding=True,
         return_tensors="pt",
     ).to(_device)
@@ -1654,7 +2523,7 @@ def _run_generation(
             out_ids[len(in_ids):]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
-        output = active_proc.batch_decode(
+        output = _processor.batch_decode(
             trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
@@ -1728,27 +2597,33 @@ def _grade_sync(
     question_label: str | None = None,
     expected_final_answer: str | None = None,
     other_questions_on_page: list[str] | None = None,
-    _boost_resolution: bool = False,
+    file_id: str | None = None,
+    retrieval_context: list[str] | None = None,
 ) -> dict[str, Any]:
     """Blocking implementation of :func:`grade_answer`.
 
     Flow:
 
-    1. Decode + validate the image bytes (raises ``ValueError`` on
-       corrupt payloads).
-    2. Acquire the GPU lock non-blockingly; fail fast with
+    1. Decode + preprocess the image bytes (``ValueError`` on corrupt
+       payloads).
+    2. OCR the student's handwriting with GLM-OCR to produce a
+       plain-text transcription. This runs BEFORE the GPU lock is
+       acquired: the OCR model holds its own weights and a slow OCR
+       pass shouldn't keep the Qwen grading lock held.
+    3. Optionally expand the RAG context by searching Chroma with the
+       transcription (no-op when ``_RAG_EXTRA_TOP_K == 0`` or the
+       caller passed ``retrieval_context`` explicitly).
+    4. Acquire the GPU lock non-blockingly; fail fast with
        :class:`GradingBusy` if another request is mid-generation.
-    3. When ``_boost_resolution=True``, create a temporary processor
-       with ``max_pixels=_MAX_PIXELS_RETRY`` so the high-res retry
-       path gets more visual tokens without mutating the global state.
-    4. Run a single ``model.generate`` pass; on JSON parse failure
-       retry once with the strict suffix. If both attempts fail,
-       return the safe zero-score envelope.
-    5. Run ``_validate_score`` to enforce clamping, the score=0
+    5. Run a single Qwen ``model.generate`` pass on the text-only
+       prompt. On JSON parse failure retry once with the strict
+       suffix. If both attempts fail, return the safe zero-score
+       envelope.
+    6. Run ``_validate_score`` to enforce clamping, the score=0
        override (majority-steps guard), and ``first_error_step``
        back-fill.
-    6. Emit one structured log line with per-request metrics
-       (image_size, pixels, output_len, parse, retry, boost,
+    7. Emit one structured log line with per-request metrics
+       (image_size, transcription_len, output_len, parse, retry,
        step tally, score, confidence, safety_net, VRAM, latency).
 
     Parameters
@@ -1769,9 +2644,13 @@ def _grade_sync(
         Expected final answer for the safety-net comparison.
     other_questions_on_page:
         Other question labels on the same page.
-    _boost_resolution:
-        When ``True``, create a temporary processor with the high-res
-        pixel cap (``_MAX_PIXELS_RETRY``) for this call only.
+    file_id:
+        When provided, scope the optional secondary RAG retrieval
+        to the answer-key file the student is being graded against.
+    retrieval_context:
+        Pre-computed extra RAG chunks to inline into the prompt.
+        When ``None`` and ``_RAG_EXTRA_TOP_K > 0`` we run our own
+        retrieval pass keyed off the transcription.
 
     Returns
     -------
@@ -1795,7 +2674,45 @@ def _grade_sync(
         )
 
     pil_image = _decode_image(image_bytes)
-    pixels_after_resize = _estimate_pixels_after_resize(pil_image)
+
+    # --- OCR stage (GLM-OCR) ----------------------------------------------
+    # Runs BEFORE the Qwen lock is taken so a slow OCR pass cannot
+    # starve the grading queue.
+    t_ocr_start = time.perf_counter()
+    transcription = _transcribe_handwriting(pil_image)
+    ocr_ms = (time.perf_counter() - t_ocr_start) * 1000.0
+    logger.info(
+        "grading: GLM-OCR transcription done chars=%d ms=%.1f",
+        len(transcription),
+        ocr_ms,
+    )
+    # Dump the transcription itself so accuracy issues can be diagnosed
+    # without re-running OCR. 600 chars is enough for a typical 3-step
+    # polynomial and keeps the log line manageable. Toggle off via
+    # ``GRADING_LOG_TRANSCRIPTION=0`` if this gets too noisy.
+    if os.getenv("GRADING_LOG_TRANSCRIPTION", "1") == "1":
+        preview = transcription if len(transcription) <= 600 else transcription[:600] + "..."
+        logger.info(
+            "grading: GLM-OCR transcription text (question_label=%r):\n%s",
+            question_label,
+            preview,
+        )
+
+    # --- RAG expansion (optional) -----------------------------------------
+    # Uses the OCR transcription as the retrieval key. Falls back to
+    # whatever the caller passed in; skipped silently on any error.
+    effective_retrieval = retrieval_context
+    if effective_retrieval is None and _RAG_EXTRA_TOP_K > 0:
+        effective_retrieval = _retrieve_grading_context(
+            transcription,
+            file_id=file_id,
+            top_k=_RAG_EXTRA_TOP_K,
+        )
+        logger.debug(
+            "grading: RAG retrieval top_k=%d fetched=%d",
+            _RAG_EXTRA_TOP_K,
+            len(effective_retrieval or []),
+        )
 
     if not _generate_lock.acquire(blocking=False):
         raise GradingBusy(
@@ -1808,35 +2725,16 @@ def _grade_sync(
     parse_retried = False
     raw = ""
 
-    # Build an optional boosted processor for the high-res retry path.
-    # We create it BEFORE acquiring the lock above so any import errors
-    # surface immediately without silently falling back to standard res.
-    boost_processor: Any = None
-    if _boost_resolution:
-        try:
-            from transformers import AutoProcessor as _AP
-            boost_processor = _AP.from_pretrained(
-                MODEL_ID,
-                min_pixels=_MIN_PIXELS,
-                max_pixels=_MAX_PIXELS_RETRY,
-            )
-        except Exception as exc:
-            logger.warning(
-                "grading: could not create boost processor "
-                "max_pixels_retry=%d; using default. error=%s",
-                _MAX_PIXELS_RETRY,
-                exc,
-            )
-
     try:
         # --- Pass 1 -----------------------------------------------------
         messages = _build_messages(
-            pil_image, question, answer_key, max_score, subject,
+            transcription, question, answer_key, max_score, subject,
             strict_retry=False,
             question_label=question_label,
             other_questions_on_page=other_questions_on_page,
+            retrieval_context=effective_retrieval,
         )
-        raw = _run_generation(messages, processor=boost_processor)
+        raw = _run_generation(messages)
 
         try:
             data = _parse_json_response(raw, required_fields=_GRADING_REQUIRED_FIELDS)
@@ -1852,12 +2750,13 @@ def _grade_sync(
 
             # --- Pass 2 (strict retry) ---------------------------------
             messages = _build_messages(
-                pil_image, question, answer_key, max_score, subject,
+                transcription, question, answer_key, max_score, subject,
                 strict_retry=True,
                 question_label=question_label,
                 other_questions_on_page=other_questions_on_page,
+                retrieval_context=effective_retrieval,
             )
-            raw = _run_generation(messages, processor=boost_processor)
+            raw = _run_generation(messages)
             try:
                 data = _parse_json_response(
                     raw, required_fields=_GRADING_REQUIRED_FIELDS
@@ -1879,18 +2778,19 @@ def _grade_sync(
     if data is None:
         result = _parse_failed_fallback(raw, max_score)
         logger.info(
-            "grading: image_size_bytes=%d pixels=%d output_len=%d parse_success=%s "
-            "retried=%s boost=%s correct=0/%d score=0/%d confidence=low "
-            "safety_net=False vram_mb=%d ms=%.1f",
+            "grading: image_size_bytes=%d ocr_chars=%d output_len=%d parse_success=%s "
+            "retried=%s rag_chunks=%d correct=0/%d score=0/%d confidence=low "
+            "safety_net=False vram_mb=%d ocr_ms=%.1f llm_ms=%.1f",
             len(image_bytes),
-            pixels_after_resize,
+            len(transcription),
             len(raw),
             parse_success,
             parse_retried,
-            _boost_resolution,
+            len(effective_retrieval or []),
             0,
             max_score,
             _vram_used_mb(),
+            ocr_ms,
             inference_ms,
         )
         return result
@@ -1898,18 +2798,55 @@ def _grade_sync(
     # --- Happy path: repair known failure modes, then validate --------
     # Order matters:
     #   1. Strip question label from step 1 (may flip step 1 correct).
-    #   2. Final-answer safety net (may flip overall correct + full marks
-    #      when the student reached the right answer despite intermediate
-    #      transcription noise like cursive 3 vs 8).
-    #   3. _validate_score (clamps, score=0 override, first_error_step
+    #   2. Final-answer safety net (may upgrade overall correct + full
+    #      marks when the student reached the right answer despite
+    #      intermediate OCR noise; now protected by the step-1 copy,
+    #      transcription-presence, and transcription-confirmed-wrong-step
+    #      guards so cancelling-errors cases like Q 0003 are NOT upgraded).
+    #   3. Reconcile Qwen self-contradiction: if Qwen's narrative says
+    #      "all correct" but per-step flags disagree AND the raw OCR
+    #      transcription confirms the student wrote the correct question
+    #      + final answer, trust the narrative and flip the contradictory
+    #      flags. Fixes Q 0002-style "score 3/5 but feedback says perfect"
+    #      output.
+    #   4. Enforce step 1 copy from the question (may force step 1 wrong
+    #      when the student copied the starting expression incorrectly;
+    #      uses transcription to defeat Qwen-rewrites step-1 edits).
+    #   5. _validate_score (clamps, score recomputation, first_error_step
     #      back-fill, score_breakdown).
-    # Both repair helpers are no-ops when their respective hints weren't
-    # supplied by the route (i.e. the manual /submit path runs with
-    # both as None and lands directly at _validate_score).
+    #   6. Reconcile top-level feedback + error_summary with the final
+    #      step verdict so the user never sees "all correct" when the
+    #      score shows errors (or vice versa).
+    # All repair helpers are no-ops when their respective hints weren't
+    # supplied by the route (the manual /submit path runs with most as
+    # None and lands directly at _validate_score).
     _repair_question_label_in_step1(data, question_label)
-    _repair_final_answer_match(data, expected_final_answer, max_score)
+    _repair_final_answer_match(
+        data,
+        expected_final_answer,
+        max_score,
+        transcription=transcription,
+        question=question,
+        question_label=question_label,
+    )
+    _reconcile_qwen_self_contradiction(
+        data,
+        question=question,
+        expected_final_answer=expected_final_answer,
+        transcription=transcription,
+    )
+    # Deterministic backstop: if Qwen credited step 1 but its
+    # ``student_wrote`` does NOT match the question's starting
+    # expression character-for-character (or the expected question
+    # isn't present in the raw OCR transcription at all), force step 1
+    # wrong. Handles the "student copied +y^2 instead of -y^2 but Qwen
+    # helpfully rewrote it to match" failure mode.
+    _enforce_step1_starting_expression(
+        data, question, question_label, transcription=transcription
+    )
 
     _validate_score(data, max_score)
+    _reconcile_top_level_feedback_with_steps(data, expected_final_answer)
     extracted_steps = _sanitize_steps(data.get("extracted_steps"))
 
     total_steps = len(extracted_steps)
@@ -1941,15 +2878,15 @@ def _grade_sync(
     }
 
     logger.info(
-        "grading: image_size_bytes=%d pixels=%d output_len=%d parse_success=%s "
-        "retried=%s boost=%s correct=%d/%d score=%d/%d confidence=%s "
-        "safety_net=%s vram_mb=%d ms=%.1f",
+        "grading: image_size_bytes=%d ocr_chars=%d output_len=%d parse_success=%s "
+        "retried=%s rag_chunks=%d correct=%d/%d score=%d/%d confidence=%s "
+        "safety_net=%s vram_mb=%d ocr_ms=%.1f llm_ms=%.1f",
         len(image_bytes),
-        pixels_after_resize,
+        len(transcription),
         len(raw),
         parse_success,
         parse_retried,
-        _boost_resolution,
+        len(effective_retrieval or []),
         correct_steps,
         total_steps,
         final_score,
@@ -1957,6 +2894,7 @@ def _grade_sync(
         confidence_val,
         safety_net_val,
         _vram_used_mb(),
+        ocr_ms,
         inference_ms,
     )
     return result
@@ -1975,19 +2913,23 @@ async def grade_answer(
     question_label: str | None = None,
     expected_final_answer: str | None = None,
     other_questions_on_page: list[str] | None = None,
+    file_id: str | None = None,
+    retrieval_context: list[str] | None = None,
 ) -> dict[str, Any]:
     """Grade a single handwritten answer image.
 
-    Offloads the blocking HuggingFace ``generate`` call to the default
-    asyncio executor so the FastAPI event loop stays responsive.
-    Nothing is written to disk; everything is held in memory for the
-    duration of the call.
+    Offloads the blocking HuggingFace ``generate`` call and the
+    GLM-OCR transcription to the default asyncio executor so the
+    FastAPI event loop stays responsive. Nothing is written to disk;
+    everything is held in memory for the duration of the call.
 
-    When the first grading pass returns ``confidence == "low"``, a
-    second pass is automatically attempted at boosted resolution
-    (``max_pixels=_MAX_PIXELS_RETRY``) to improve OCR accuracy on
-    small or blurry handwriting. One retry maximum; any failure during
-    the retry is logged and the original result is returned.
+    Pipeline (per request):
+
+    1. GLM-OCR transcribes the handwritten image to plain text.
+    2. (Optional) Chroma + bge-m3 fetches extra similar-problem
+       chunks as reference material.
+    3. Qwen2.5-VL (text-only) grades the transcription against the
+       answer key and produces the JSON envelope.
 
     Parameters
     ----------
@@ -2030,11 +2972,20 @@ async def grade_answer(
     other_questions_on_page:
         List of OTHER question labels present on the same page -
         populated by ``/submit-multi-by-image`` so the grading prompt
-        can tell the VLM to grade only this question's work and ignore
+        can tell the LLM to grade only this question's work and ignore
         lines labelled with the other numbers. Prevents cross-question
         contamination of ``extracted_steps`` when one image carries
         multiple student answers. Omit (or pass ``None`` / empty list)
         for single-question grading.
+    file_id:
+        UUID of the :class:`AnswerKeyFile` we are grading against.
+        Used to scope the optional secondary RAG retrieval so it only
+        returns chunks from the same answer-key PDF. Safe to omit.
+    retrieval_context:
+        Pre-fetched extra RAG chunks the caller wants inlined as
+        reference material. When ``None`` and
+        ``GRADING_RAG_EXTRA_TOP_K > 0``, the grader performs its own
+        bge-m3 + Chroma retrieval hop keyed off the OCR'd transcription.
 
     Returns
     -------
@@ -2061,7 +3012,7 @@ async def grade_answer(
     loop = asyncio.get_running_loop()
 
     try:
-        result = await asyncio.wait_for(
+        return await asyncio.wait_for(
             loop.run_in_executor(
                 None,
                 _grade_sync,
@@ -2073,7 +3024,8 @@ async def grade_answer(
                 question_label,
                 expected_final_answer,
                 other_questions_on_page,
-                False,  # _boost_resolution=False for first pass
+                file_id,
+                retrieval_context,
             ),
             timeout=_GRADING_TIMEOUT_S,
         )
@@ -2082,60 +3034,28 @@ async def grade_answer(
             f"Grading timed out after {_GRADING_TIMEOUT_S:.0f}s; retry shortly."
         ) from exc
 
-    # Low-confidence retry at boosted resolution (one retry maximum).
-    if result.get("confidence") == "low":
-        logger.info(
-            "grading: confidence=low, retrying at boosted resolution "
-            "max_pixels_retry=%d boost=True",
-            _MAX_PIXELS_RETRY,
-        )
-        try:
-            result_retry = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    _grade_sync,
-                    image_bytes,
-                    question,
-                    answer_key,
-                    max_score,
-                    subject,
-                    question_label,
-                    expected_final_answer,
-                    other_questions_on_page,
-                    True,  # _boost_resolution=True
-                ),
-                timeout=_GRADING_TIMEOUT_S,
-            )
-            result = result_retry
-        except Exception as exc:
-            logger.warning(
-                "grading: boost-resolution retry failed retried=True boost=True; "
-                "returning original low-confidence result. error=%s",
-                exc,
-            )
-
-    return result
-
 
 # --------------------------------------------------------------------- question identification
-# A short, low-token Qwen pass that reads the *top* of a handwritten
-# page and extracts either the question number the student wrote or
-# the problem statement they copied. The caller then uses those hints
-# to pick the correct ``AnswerKeyItem`` via either exact SQL lookup
-# (on ``(file_id, question_no)``) or semantic similarity in Chroma.
+# A short, low-token Qwen pass that looks at the GLM-OCR transcription
+# of a handwritten page and extracts either the question number the
+# student wrote or the problem statement they copied. The caller then
+# uses those hints to pick the correct ``AnswerKeyItem`` via either
+# exact SQL lookup (on ``(file_id, question_no)``) or semantic
+# similarity in Chroma.
 #
-# This is deliberately a separate, tiny generation pass (~128 tokens)
-# because the full grading pass is slow and bundling "identify + grade"
-# into one prompt would (a) bloat the output-token budget and (b)
-# force the VLM to simultaneously read AND reason, which empirically
-# hurts both tasks.
+# This is deliberately a separate, tiny generation pass (~128 tokens):
+# it runs against text only (the OCR output), so it's much cheaper
+# than the full grading pass and gives us a reliable identification
+# signal without asking the grading LLM to multiplex "identify + grade".
 
 _IDENTIFY_SYSTEM_PROMPT: str = (
-    "You are reading a student's handwritten math work to identify "
-    "which question they are answering. Do NOT grade. Do NOT solve."
+    "You are reading a GLM-OCR transcription of a student's handwritten "
+    "math work to identify which question they are answering. Do NOT grade. "
+    "Do NOT solve. Output only the requested JSON envelope."
 )
 
-_IDENTIFY_USER_PROMPT: str = """Look at the top of this handwritten page. Extract:
+_IDENTIFY_USER_PROMPT_TEMPLATE: str = """Below is the OCR transcription of the TOP portion of a student's handwritten
+page. Using only what is in the transcription, extract:
 
 1. question_number: if the student wrote a question number at the top
    of the page (e.g. "1.", "Q3", "Question 2", "#5", "2.a") return
@@ -2147,30 +3067,34 @@ _IDENTIFY_USER_PROMPT: str = """Look at the top of this handwritten page. Extrac
    before any working), return it as a single line. If the page only
    contains working/calculation with no restated problem, return null.
 
-3. read_confidence: "high" if the handwriting at the top is clearly
-   legible; "medium" if partially legible; "low" if mostly illegible.
+3. read_confidence: "high" if the transcription's opening lines are
+   clean (no ``?``, no garbled characters); "medium" if partially
+   clean; "low" if mostly garbled or empty.
+
+TRANSCRIPTION:
+<<<OCR_BEGIN
+{transcription}
+OCR_END>>>
 
 OUTPUT RULES:
 - Output RAW JSON only
 - No prose, no markdown fences, no ```json
-- Start your response with { and end with }
-- Example: {"question_number": "3", "problem_text": null, "read_confidence": "high"}"""
-
-# Short output budget. The JSON envelope is 60-120 tokens in practice;
-# 128 leaves a little headroom without letting the model run on.
-_IDENTIFY_MAX_NEW_TOKENS: int = int(os.getenv("GRADING_IDENTIFY_MAX_NEW_TOKENS", "128"))
+- Start your response with {{ and end with }}
+- Example: {{"question_number": "3", "problem_text": null, "read_confidence": "high"}}"""
 
 
 def _identify_sync(image_bytes: bytes) -> dict[str, Any]:
     """Blocking implementation of :func:`identify_question`.
 
-    Shares the singleton model + :data:`_generate_lock` with the main
-    grading pass. Returns a dict with three keys - ``question_number``,
-    ``problem_text``, ``read_confidence`` - any of which may be
-    ``None`` / ``"low"`` when the handwriting at the top of the page
-    is missing or illegible. On JSON parse failure we fall back to a
-    zero-signal response rather than raising, so the caller can still
-    ask the student to disambiguate via the 422 path.
+    Runs GLM-OCR over the image first, then asks Qwen (text-only) to
+    pull the question number / problem preview / confidence out of the
+    transcription. Shares the singleton Qwen model +
+    :data:`_generate_lock` with the main grading pass. Returns a dict
+    with three keys - ``question_number``, ``problem_text``,
+    ``read_confidence`` - any of which may be ``None`` / ``"low"`` when
+    the transcription is missing or illegible. On JSON parse failure we
+    fall back to a zero-signal response rather than raising, so the
+    caller can still ask the student to disambiguate via the 422 path.
 
     Parameters
     ----------
@@ -2199,6 +3123,36 @@ def _identify_sync(image_bytes: bytes) -> dict[str, Any]:
 
     pil_image = _decode_image(image_bytes)
 
+    # GLM-OCR transcribes the page first (outside the Qwen GPU lock).
+    # Identify only needs enough to read the question label + any copied
+    # problem statement, so we cap the budget lower than the grading
+    # transcription to keep this pass fast.
+    t_ocr_start = time.perf_counter()
+    transcription = _transcribe_handwriting(
+        pil_image, max_new_tokens=_OCR_IDENTIFY_MAX_NEW_TOKENS
+    )
+    ocr_ms = (time.perf_counter() - t_ocr_start) * 1000.0
+
+    if not transcription.strip():
+        logger.info(
+            "identify: GLM-OCR returned empty transcription ocr_ms=%.1f; "
+            "returning zero-signal result",
+            ocr_ms,
+        )
+        return {
+            "question_number": None,
+            "problem_text": None,
+            "read_confidence": "low",
+        }
+
+    # Only the top ~15 lines inform the identification; passing the
+    # whole page costs tokens and can confuse the LLM with mid-page
+    # math that mentions other numbers.
+    top_lines = [
+        line for line in transcription.splitlines() if line.strip()
+    ][:15]
+    top_transcription = "\n".join(top_lines)
+
     if not _generate_lock.acquire(blocking=False):
         raise GradingBusy(
             "A previous grading request is still running on the GPU; "
@@ -2211,10 +3165,9 @@ def _identify_sync(image_bytes: bytes) -> dict[str, Any]:
             {"role": "system", "content": _IDENTIFY_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": [
-                    {"type": "image", "image": pil_image},
-                    {"type": "text", "text": _IDENTIFY_USER_PROMPT},
-                ],
+                "content": _IDENTIFY_USER_PROMPT_TEMPLATE.format(
+                    transcription=top_transcription,
+                ),
             },
         ]
         raw = _run_generation(messages, max_new_tokens=_IDENTIFY_MAX_NEW_TOKENS)
@@ -2244,10 +3197,11 @@ def _identify_sync(image_bytes: bytes) -> dict[str, Any]:
 
     logger.info(
         "identify: question_number=%r problem_text_len=%d read_confidence=%s "
-        "elapsed_ms=%.1f vram_mb=%d",
+        "ocr_ms=%.1f llm_ms=%.1f vram_mb=%d",
         qn,
         len(pt or ""),
         rc,
+        ocr_ms,
         elapsed_ms,
         _vram_used_mb(),
     )
@@ -2262,11 +3216,12 @@ def _identify_sync(image_bytes: bytes) -> dict[str, Any]:
 async def identify_question(image_bytes: bytes) -> dict[str, Any]:
     """Extract question identifiers from a student's handwritten page.
 
-    Runs a short Qwen2.5-VL pass (~128 tokens) and returns whichever of
-    ``question_number`` / ``problem_text`` the model could read from the
-    top of the page. Callers feed the result into
-    :func:`app.services.question_resolver.resolve_question` to pick the
-    matching :class:`AnswerKeyItem`.
+    Runs GLM-OCR over the page to produce a plain-text transcription,
+    then uses a short Qwen text pass (~128 tokens) to pull the
+    question number / problem preview / read confidence out of the
+    top of the transcription. Callers feed the result into
+    :func:`app.services.question_resolver.resolve_question` to pick
+    the matching :class:`AnswerKeyItem`.
 
     Parameters
     ----------
@@ -2307,29 +3262,42 @@ async def identify_question(image_bytes: bytes) -> dict[str, Any]:
 # --------------------------------------------------------------------- multi-question identification
 # Sibling of :func:`identify_question` for the multi-question endpoint
 # (``/submit-multi-by-image``). Instead of reading just the top of the
-# page and returning ONE label, it scans the whole page and returns a
-# list of distinct question labels (up to MAX) the student wrote.
+# page and returning ONE label, it scans the full GLM-OCR transcription
+# and returns a list of distinct question labels (up to MAX) the
+# student wrote.
 #
-# We run this as a single Qwen pass (still cheap - ~256 tokens) rather
-# than N independent "is question X here?" calls. The returned list
-# then drives the per-question grade loop in the route layer.
+# We run this as a single Qwen text pass (still cheap - ~256 tokens)
+# rather than N independent "is question X here?" calls. The returned
+# list then drives the per-question grade loop in the route layer.
 
 _IDENTIFY_ALL_SYSTEM_PROMPT: str = (
-    "You are scanning a handwritten page to list which questions the "
-    "student answered. Do NOT grade. Do NOT solve."
+    "You are scanning a GLM-OCR transcription of a student's handwritten "
+    "page to list which questions they answered. Do NOT grade. Do NOT solve. "
+    "Output only the requested JSON envelope."
 )
 
-_IDENTIFY_ALL_USER_PROMPT: str = """Scan this handwritten page for QUESTION LABELS.
+_IDENTIFY_ALL_USER_PROMPT_TEMPLATE: str = """Below is the OCR transcription of an entire handwritten page. Scan it top to
+bottom and list every QUESTION LABEL the student wrote.
 
 A question label is a number or short identifier at the start of a
 distinct section of student work, for example: "1.", "Q3", "0002.",
 "Question 5:", "(3)".
 
+IMPORTANT - be thorough:
+- Scan the ENTIRE transcription top to bottom, including the middle
+  and lower sections. Do NOT stop after the first label you find.
+- If you see two or more labelled sections, you MUST list all of
+  them. Missing a label is a worse error than listing an extra one.
+- Treat each distinct number the student wrote as its own entry,
+  even if the on-page expressions happen to look similar to examples
+  you have seen in instructions.
+
 Return ONE entry per distinct question the student answered on this
 page. Return at most 5 entries. Order entries top-to-bottom as they
-appear on the page. Do NOT return the same question twice. Do NOT
-include printed headers or answer-key labels - only include labels
-the student wrote in their own handwriting.
+appear in the transcription. Do NOT return the same question twice.
+Do NOT include printed headers or answer-key labels - only include
+labels the student wrote in their own handwriting (i.e. that appear
+in the transcription).
 
 For each entry, include:
 - question_number: the label as written, digits only if it is numeric
@@ -2338,32 +3306,26 @@ For each entry, include:
   student wrote for this question - the starting expression they
   copied from the exam. If the student did NOT copy the problem
   statement (started straight with working), set this to null.
-- confidence: "high" | "medium" | "low" for how clearly you can see
-  this label on the page.
+- confidence: "high" | "medium" | "low" for how clearly the label
+  reads in the transcription (low if the surrounding text is garbled).
+
+TRANSCRIPTION:
+<<<OCR_BEGIN
+{transcription}
+OCR_END>>>
 
 OUTPUT RULES:
 - Output RAW JSON only
 - No prose, no markdown fences, no ```json
-- Start your response with { and end with }
-- Shape: {"questions": [{"question_number": "...", "problem_text_preview": "..." or null, "confidence": "..."}, ...]}
+- Start your response with {{ and end with }}
+- Shape: {{"questions": [{{"question_number": "...", "problem_text_preview": "..." or null, "confidence": "..."}}, ...]}}
 
-Example valid output:
-{"questions": [
-  {"question_number": "0002", "problem_text_preview": "Simplify (x+2)^2", "confidence": "high"},
-  {"question_number": "0003", "problem_text_preview": "(3x^2+2xy-y^2)-(x^2-5xy-4y^2)", "confidence": "high"}
-]}"""
-
-# Tighter than the grading pass (1024) but looser than single identify
-# (128) because multi-question can emit up to 5 entries.
-_IDENTIFY_ALL_MAX_NEW_TOKENS: int = int(
-    os.getenv("GRADING_IDENTIFY_ALL_MAX_NEW_TOKENS", "256")
-)
-
-# Hard cap on entries we process downstream even if the model emits
-# more. Prevents pathological pages from triggering 10+ grading passes.
-_IDENTIFY_ALL_MAX_RESULTS: int = int(
-    os.getenv("GRADING_MAX_QUESTIONS_PER_IMAGE", "5")
-)
+Example valid output (illustrative only - the labels and text below
+are placeholders; use what you ACTUALLY see in the transcription):
+{{"questions": [
+  {{"question_number": "<label_a>", "problem_text_preview": "<first line of a>", "confidence": "high"}},
+  {{"question_number": "<label_b>", "problem_text_preview": null, "confidence": "medium"}}
+]}}"""
 
 
 def _sanitize_identification_entry(raw: Any) -> dict[str, Any] | None:
@@ -2409,9 +3371,10 @@ def _sanitize_identification_entry(raw: Any) -> dict[str, Any] | None:
 def _identify_all_sync(image_bytes: bytes) -> list[dict[str, Any]]:
     """Blocking implementation of :func:`identify_all_questions`.
 
-    Returns a list (possibly empty) of identification entries. Dedups
-    by ``question_number`` keeping first occurrence (preserves
-    top-to-bottom order). Caps at ``_IDENTIFY_ALL_MAX_RESULTS`` entries.
+    Runs GLM-OCR over the whole page, then asks Qwen (text-only) to
+    extract up to ``_IDENTIFY_ALL_MAX_RESULTS`` distinct question
+    labels. Dedups by ``question_number`` keeping first occurrence
+    (preserves top-to-bottom order).
 
     Like :func:`_identify_sync` we swallow JSON parse failures rather
     than raising: the route layer can still 422 with "no questions
@@ -2443,6 +3406,23 @@ def _identify_all_sync(image_bytes: bytes) -> list[dict[str, Any]]:
 
     pil_image = _decode_image(image_bytes)
 
+    # identify_all needs the WHOLE page (labels scattered top-to-bottom),
+    # so we give it twice the per-identify budget but still keep it well
+    # below the grading transcription budget.
+    t_ocr_start = time.perf_counter()
+    transcription = _transcribe_handwriting(
+        pil_image, max_new_tokens=_OCR_IDENTIFY_MAX_NEW_TOKENS * 2
+    )
+    ocr_ms = (time.perf_counter() - t_ocr_start) * 1000.0
+
+    if not transcription.strip():
+        logger.info(
+            "identify_all: GLM-OCR returned empty transcription ocr_ms=%.1f; "
+            "returning empty list",
+            ocr_ms,
+        )
+        return []
+
     if not _generate_lock.acquire(blocking=False):
         raise GradingBusy(
             "A previous grading request is still running on the GPU; "
@@ -2455,10 +3435,9 @@ def _identify_all_sync(image_bytes: bytes) -> list[dict[str, Any]]:
             {"role": "system", "content": _IDENTIFY_ALL_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": [
-                    {"type": "image", "image": pil_image},
-                    {"type": "text", "text": _IDENTIFY_ALL_USER_PROMPT},
-                ],
+                "content": _IDENTIFY_ALL_USER_PROMPT_TEMPLATE.format(
+                    transcription=transcription,
+                ),
             },
         ]
         raw = _run_generation(
@@ -2504,10 +3483,11 @@ def _identify_all_sync(image_bytes: bytes) -> list[dict[str, Any]]:
             break
 
     logger.info(
-        "identify_all: detected=%d (cap=%d) elapsed_ms=%.1f vram_mb=%d "
+        "identify_all: detected=%d (cap=%d) ocr_ms=%.1f llm_ms=%.1f vram_mb=%d "
         "labels=%r",
         len(out),
         _IDENTIFY_ALL_MAX_RESULTS,
+        ocr_ms,
         elapsed_ms,
         _vram_used_mb(),
         [e["question_number"] for e in out],
@@ -2520,7 +3500,7 @@ async def identify_all_questions(image_bytes: bytes) -> list[dict[str, Any]]:
 
     Async wrapper around :func:`_identify_all_sync`. Dispatches onto
     the default executor so the FastAPI event loop stays responsive
-    during the ~3-5s Qwen pass.
+    during the GLM-OCR pass + the short Qwen text pass.
 
     Parameters
     ----------

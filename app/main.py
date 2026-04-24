@@ -19,9 +19,10 @@ from app.services.ocr_service import get_ocr_status, log_ocr_status
 from app.services.storage import StorageError, get_storage_service
 
 # ``force=True`` makes sure our handlers/level win even if uvicorn (or any
-# imported library like PaddleOCR) installed handlers on the root logger
-# before this point. Without it, third-party libs can silently suppress our
-# INFO logs from ``app.*`` loggers on process startup or after a reload.
+# imported library, e.g. transformers / torch) installed handlers on the
+# root logger before this point. Without it, third-party libs can silently
+# suppress our INFO logs from ``app.*`` loggers on process startup or after
+# a reload.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -41,7 +42,7 @@ async def lifespan(app: FastAPI):
     Startup order:
       1. Optionally create SQL tables (dev-only, gated on AUTO_CREATE_DB=1).
       2. Probe MinIO and ensure the answer-key bucket exists.
-      3. Log the PaddleOCR fallback status (package importability only).
+      3. Log the GLM-OCR fallback status (package importability only).
       4. Pre-fetch the Keycloak JWKS so the first authenticated request
          does not pay the JWKS round-trip.
 
@@ -66,9 +67,9 @@ async def lifespan(app: FastAPI):
         )
 
     # We deliberately pass ``probe_engine=False`` here: we only want to
-    # confirm the package is importable. Building the engine during startup
-    # would make ``--reload`` painfully slow and let PaddleOCR hijack the
-    # root logger before any request runs.
+    # confirm transformers is importable. Building the GLM-OCR engine
+    # during startup would download several GB of weights and pin GPU
+    # memory before the first real request arrives.
     log_ocr_status(probe_engine=False)
 
     try:

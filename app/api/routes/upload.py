@@ -32,6 +32,7 @@ Failure handling:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 
@@ -50,8 +51,8 @@ from app.services.chroma_service import (
 )
 from app.services.embedding_service import build_embedding_text, get_embedding
 from app.services.ocr_service import (
-    extract_text_from_image_file,
-    extract_text_with_ocr,
+    extract_text_from_image_file_async,
+    extract_text_with_ocr_async,
     is_ocr_available,
 )
 from app.services.parsers.parser_selector import parse_with_selected_strategy
@@ -191,7 +192,7 @@ async def upload_answer_key(
     try:
         # Step 3: extract pages (PDF or image) and determine pdf_mode.
         if kind == "pdf":
-            pages, pdf_mode = _extract_pdf_pages(
+            pages, pdf_mode = await _extract_pdf_pages(
                 raw_bytes,
                 ocr_mode=ocr_mode,
                 filename=file.filename,
@@ -204,7 +205,7 @@ async def upload_answer_key(
                     page_range,
                     file.filename,
                 )
-            pages = _extract_image_pages(raw_bytes, filename=file.filename)
+            pages = await _extract_image_pages(raw_bytes, filename=file.filename)
             pdf_mode = PdfMode.IMAGE_PDF.value
 
         if not pages or not any(p["text"].strip() for p in pages):
@@ -402,13 +403,19 @@ def _mark_storage_failed(
         logger.exception("upload: failed to persist storage failure state")
 
 
-def _extract_pdf_pages(
+async def _extract_pdf_pages(
     pdf_bytes: bytes,
     ocr_mode: str,
     filename: str,
     page_range: str = "",
 ) -> tuple[list[dict], str]:
-    """Return ``(pages, pdf_mode)`` for a PDF with OCR-aware routing."""
+    """Return ``(pages, pdf_mode)`` for a PDF with OCR-aware routing.
+
+    Async because the OCR helpers dispatch concurrent GLM-OCR requests
+    through :mod:`app.services.ocr_service` so vLLM's continuous batcher
+    can fuse pages into a single forward pass instead of OCR'ing them
+    one by one.
+    """
     try:
         pages = extract_pages_from_pdf(pdf_bytes)
     except (fitz.FileDataError, RuntimeError) as exc:
@@ -443,36 +450,73 @@ def _extract_pdf_pages(
         return pages, pdf_mode
 
     if pdf_mode == "image_pdf":
-        _apply_pdf_ocr_first(pages, pdf_bytes, filename=filename)
+        await _apply_pdf_ocr_first(pages, pdf_bytes, filename=filename)
     else:
-        _apply_pdf_ocr_fallback(pages, pdf_bytes, ocr_mode=ocr_mode, filename=filename)
+        await _apply_pdf_ocr_fallback(
+            pages, pdf_bytes, ocr_mode=ocr_mode, filename=filename
+        )
 
     return pages, pdf_mode
 
 
-def _apply_pdf_ocr_first(
+async def _ocr_page_safe(
+    image_bytes: bytes,
+    page_no: int,
+    filename: str,
+) -> str:
+    """Run a single async GLM-OCR call and swallow any error.
+
+    Returns the cleaned transcription, or ``""`` on any failure (network
+    error, vLLM 5xx, timeout, empty response). Mirrors the
+    "fail-gracefully-to-empty-string" contract of the sync helpers.
+    Factored out so ``asyncio.gather`` sees an awaitable that never
+    raises, which keeps the "concurrent fan-out + sequential finalise"
+    pattern simple (no ``return_exceptions=True`` gymnastics in the
+    caller).
+    """
+    try:
+        return await extract_text_with_ocr_async(image_bytes)
+    except Exception:
+        logger.exception(
+            "upload: OCR threw while processing page=%d for %s", page_no, filename
+        )
+        return ""
+
+
+async def _apply_pdf_ocr_first(
     pages: list[dict],
     pdf_bytes: bytes,
     filename: str,
 ) -> None:
-    """OCR every page and REPLACE its text unconditionally.
+    """OCR every page and REPLACE its text unconditionally (async fan-out).
 
     Used for true image PDFs where native extraction yields empty strings.
     Per-page errors are swallowed so a single bad page cannot fail the whole
     upload.
-    """
-    ocr_success = 0
 
+    Three-phase pipeline for throughput:
+
+    1. Render every page to PNG bytes sequentially (PyMuPDF is fast
+       and CPU-bound; parallelising this adds thread-pool overhead that
+       isn't worth it for typical page counts).
+    2. Fire one async GLM-OCR request per page via
+       :func:`asyncio.gather` so vLLM sees them as a continuous batch.
+       For a 10-page image PDF this cuts total OCR latency from
+       ~10 x per_page_ms to close to 1 x per_page_ms + batching overhead.
+    3. Iterate the results in page order and apply them to the
+       ``pages`` list in place. Quality logging runs here so the
+       log order matches the page order.
+    """
     logger.info(
         "upload: OCR-first MODE file=%s pages=%d (image PDF detected)",
         filename,
         len(pages),
     )
 
+    # --- Phase 1: render PNGs for every page (skip pages that fail) ---------
+    render_jobs: list[tuple[dict, bytes]] = []
     for page in pages:
         page_no = page["page_number"]
-        native_text = page["text"]
-
         try:
             image_bytes = render_page_to_png_bytes(pdf_bytes, page_no)
         except Exception:
@@ -480,14 +524,28 @@ def _apply_pdf_ocr_first(
                 "upload: failed to render page=%d for %s", page_no, filename
             )
             continue
+        render_jobs.append((page, image_bytes))
 
-        try:
-            ocr_text = extract_text_with_ocr(image_bytes)
-        except Exception:
-            logger.exception(
-                "upload: OCR threw while processing page=%d for %s", page_no, filename
-            )
-            ocr_text = ""
+    if not render_jobs:
+        logger.info(
+            "upload: OCR-first SUMMARY file=%s pages_ocred=0/%d (no renders)",
+            filename, len(pages),
+        )
+        return
+
+    # --- Phase 2: fire all OCR calls concurrently ---------------------------
+    ocr_texts = await asyncio.gather(
+        *(
+            _ocr_page_safe(img_bytes, page["page_number"], filename)
+            for page, img_bytes in render_jobs
+        )
+    )
+
+    # --- Phase 3: apply results in page order --------------------------------
+    ocr_success = 0
+    for (page, _), ocr_text in zip(render_jobs, ocr_texts):
+        page_no = page["page_number"]
+        native_text = page["text"]
 
         if not ocr_text.strip():
             logger.warning(
@@ -536,14 +594,26 @@ def _apply_page_range(
     return filtered
 
 
-def _apply_pdf_ocr_fallback(
+async def _apply_pdf_ocr_fallback(
     pages: list[dict],
     pdf_bytes: bytes,
     ocr_mode: str,
     filename: str,
 ) -> None:
     """Mutate ``pages`` in place, substituting OCR text only when genuinely
-    better. See the previous implementation notes (BUG 5 / BUG 6 fixes)."""
+    better (async fan-out). See the previous implementation notes
+    (BUG 5 / BUG 6 fixes) for the quality-gating rules.
+
+    Same three-phase pipeline as :func:`_apply_pdf_ocr_first`:
+
+    1. Walk the pages, decide which ones need OCR under the current
+       ``ocr_mode`` and native-text heuristics, and render PNGs for
+       the ones that do.
+    2. Fire all OCR calls concurrently via :func:`asyncio.gather` so
+       vLLM's continuous batcher can fuse them.
+    3. Iterate results in page order, apply the suspicious-ratio and
+       quality-vs-native gates, and mutate ``pages`` in place.
+    """
     ocr_pages: list[int] = []
     ocr_invocations = 0
     skipped_text_pages = 0
@@ -554,6 +624,8 @@ def _apply_pdf_ocr_fallback(
         filename, ocr_mode, len(pages),
     )
 
+    # --- Phase 1: decide + render -------------------------------------------
+    render_jobs: list[tuple[dict, bytes]] = []
     for page in pages:
         page_no = page["page_number"]
         native_text = page["text"]
@@ -592,13 +664,28 @@ def _apply_pdf_ocr_fallback(
             )
             continue
 
-        try:
-            ocr_text = extract_text_with_ocr(image_bytes)
-        except Exception:
-            logger.exception(
-                "upload: OCR threw while processing page=%d for %s", page_no, filename
-            )
-            ocr_text = ""
+        render_jobs.append((page, image_bytes))
+
+    if not render_jobs:
+        logger.info(
+            "upload: OCR fallback SUMMARY file=%s invoked=%d/%d "
+            "replaced=0 skipped_text_pages=%d pages_replaced=[]",
+            filename, ocr_invocations, len(pages), skipped_text_pages,
+        )
+        return
+
+    # --- Phase 2: concurrent OCR --------------------------------------------
+    ocr_texts = await asyncio.gather(
+        *(
+            _ocr_page_safe(img_bytes, page["page_number"], filename)
+            for page, img_bytes in render_jobs
+        )
+    )
+
+    # --- Phase 3: quality-gate + apply --------------------------------------
+    for (page, _), ocr_text in zip(render_jobs, ocr_texts):
+        page_no = page["page_number"]
+        native_text = page["text"]
 
         if not ocr_text.strip():
             logger.info(
@@ -647,18 +734,25 @@ def _apply_pdf_ocr_fallback(
     )
 
 
-def _extract_image_pages(image_bytes: bytes, filename: str) -> list[dict]:
-    """Turn an image upload into the same page-dict shape the parsers expect."""
+async def _extract_image_pages(image_bytes: bytes, filename: str) -> list[dict]:
+    """Turn an image upload into the same page-dict shape the parsers expect.
+
+    Async because :func:`extract_text_from_image_file_async` POSTs to vLLM
+    via ``httpx.AsyncClient``; keeping this on the event loop frees the
+    worker thread for other concurrent uploads while the OCR round-trip
+    is in flight.
+    """
     if not is_ocr_available():
         raise HTTPException(
             status_code=503,
             detail=(
                 "OCR engine is not available on the server; image uploads "
-                "require PaddleOCR to be installed"
+                "require the GLM-OCR vLLM server (zai-org/GLM-OCR) to be "
+                "reachable"
             ),
         )
 
-    text = extract_text_from_image_file(image_bytes)
+    text = await extract_text_from_image_file_async(image_bytes)
     if not text.strip():
         raise HTTPException(
             status_code=400,

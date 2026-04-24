@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json as json_lib
 import logging
+import os
 import re
 import uuid
 from typing import Any, Literal
@@ -87,8 +88,46 @@ _MAX_QUESTIONS_PER_PAPER = 5
 
 # Feedback strings from the VLM can be verbose; the upstream
 # ``POST /feedbacks`` comment field almost certainly has a column limit
-# we don't know, so cap it defensively.
-_MAX_FEEDBACK_COMMENT_CHARS = 2000
+# we don't know, so cap it defensively. Override via
+# ``GRADING_FEEDBACK_MAX_CHARS`` if the upstream rejects even 2000-char
+# bodies (empirically some endpoints cap at 255 or 500).
+_MAX_FEEDBACK_COMMENT_CHARS = int(os.getenv("GRADING_FEEDBACK_MAX_CHARS", "2000"))
+
+# Upstream feedback endpoints that do naive string interpolation (or
+# cross-service JSON decoding) sometimes choke on ASCII apostrophes,
+# backticks, or control chars inside the ``comment`` field. We can't
+# fix their bug, but we can swap the problematic characters for visually
+# identical Unicode equivalents so the student-facing UI still renders
+# correctly. Disable via ``GRADING_FEEDBACK_SANITIZE=0`` once the
+# upstream is known to be safe again.
+_SANITIZE_FEEDBACK = os.getenv("GRADING_FEEDBACK_SANITIZE", "1") == "1"
+
+# ASCII control chars (0x00-0x1F except \t \n \r, plus DEL 0x7F). Strip
+# these unconditionally - no upstream UI wants raw control bytes.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_feedback_comment(text: str) -> str:
+    """Make ``text`` safe to POST to the upstream ``comment`` field.
+
+    Two behaviours, both toggled as a group by
+    ``GRADING_FEEDBACK_SANITIZE``:
+
+    * ASCII ``'`` (apostrophe) → U+2019 ``’`` (right single quotation
+      mark). Visually identical in every student-facing UI, but doesn't
+      trip naive backends that interpolate the value into SQL or shell.
+    * ASCII ``\``` (backtick) → U+2018 ``‘`` (left single quotation
+      mark). Covers shell-injection-flavoured bugs.
+    * Control characters are stripped (``\t``, ``\n``, ``\r`` preserved).
+
+    Idempotent and cheap: returns the string unchanged when sanitisation
+    is disabled or the input is already clean.
+    """
+    if not _SANITIZE_FEEDBACK or not text:
+        return text
+    out = text.replace("'", "\u2019").replace("`", "\u2018")
+    out = _CONTROL_CHARS_RE.sub("", out)
+    return out
 
 # Fallback max score used when a question is detected on a paper but
 # has no matching upstream answer row (and therefore no declared
@@ -384,6 +423,10 @@ async def _grade_paper(
                     question_label=match_result.item.question_no,
                     expected_final_answer=expected_final_answer,
                     other_questions_on_page=others,
+                    # Scope the optional secondary RAG retrieval (controlled
+                    # by GRADING_RAG_EXTRA_TOP_K in grading_service) to the
+                    # answer-key file the student is being graded against.
+                    file_id=str(match_result.item.file_id),
                 ),
                 timeout=_PER_PAPER_GRADING_TIMEOUT_SECONDS,
             )
@@ -753,14 +796,32 @@ async def _run(
         qkey = _normalise_question_no(row.matched_question_no) or ""
         _, trace = graded_lookup[qkey]
 
-        # Full-marks shortcut: if the student scored the per-question
-        # cap, skip annotation + feedback. There is nothing instructive
-        # to say, the score itself is the verdict, and writing an
-        # "everything correct" annotation just clutters the grader UI.
+        # "Student got it right" shortcut: skip the annotation + feedback
+        # API calls entirely when there is nothing instructive to tell
+        # the student. Two triggers:
+        #
+        #   a) ``points_awarded >= cap`` - full marks. The score is
+        #      the verdict; no commentary needed.
+        #   b) ``trace.is_correct == True`` - the VLM explicitly judged
+        #      the answer correct (final answer right, all steps right).
+        #      Even if the score ended up below the cap for some
+        #      accounting reason, there is nothing to comment on and no
+        #      reason to risk an upstream 500 on a "well done" string.
+        #
         # Row still gets ``status="graded"`` + ``points_awarded`` so the
         # final bulk update commits the score.
         cap = max_points_by_qno.get(qkey, _DEFAULT_MAX_SCORE_FALLBACK)
-        if row.points_awarded >= float(cap):
+        if row.points_awarded >= float(cap) or trace.is_correct is True:
+            logger.info(
+                "pipeline: skipping annotation+feedback for answer=%s "
+                "(question_no=%s points=%.1f/%s is_correct=%s) - "
+                "student got it right; nothing to annotate.",
+                row.answer_id,
+                row.matched_question_no,
+                row.points_awarded,
+                cap,
+                trace.is_correct,
+            )
             row.status = "graded"
             return
 
@@ -801,9 +862,10 @@ async def _run(
             return
         annotations_created += 1
 
-        comment = (trace.feedback_preview or trace.error_summary or "Auto-graded")[
-            :_MAX_FEEDBACK_COMMENT_CHARS
-        ]
+        raw_comment = (
+            trace.feedback_preview or trace.error_summary or "Auto-graded"
+        )[:_MAX_FEEDBACK_COMMENT_CHARS]
+        comment = _sanitize_feedback_comment(raw_comment)
         try:
             fb_resp = await client.post_json(
                 f"answers/{row.answer_id}/feedbacks",
@@ -813,7 +875,36 @@ async def _run(
                 },
                 headers=_bearer(token),
             )
+        except AssessmentAPIStatusError as exc:
+            # Log the exact request + response so upstream 5xx/4xx can be
+            # diagnosed without re-running the grade. The comment string
+            # is the only part that differs between successful and failing
+            # feedback calls; 99% of the time the upstream is rejecting
+            # either its length or a specific character it can't handle
+            # (apostrophes, backticks, control chars).
+            logger.warning(
+                "pipeline: feedback POST failed status=%d answer_id=%s "
+                "annotation_id=%s comment_len=%d comment_preview=%r "
+                "upstream_body=%r",
+                exc.status_code,
+                row.answer_id,
+                row.annotation_id,
+                len(comment),
+                comment[:200],
+                exc.body if hasattr(exc, "body") else None,
+            )
+            row.status = "feedback_failed"
+            row.error = f"feedback: {exc}"
+            return
         except AssessmentAPIError as exc:
+            logger.warning(
+                "pipeline: feedback POST errored answer_id=%s "
+                "comment_len=%d comment_preview=%r err=%s",
+                row.answer_id,
+                len(comment),
+                comment[:200],
+                exc,
+            )
             row.status = "feedback_failed"
             row.error = f"feedback: {exc}"
             return

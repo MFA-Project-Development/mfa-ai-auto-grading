@@ -91,7 +91,8 @@ _MATH_SIGNAL_RE = re.compile(
     r"|[+\-=×÷]"              # any operator on its own
 )
 
-# Known broken-OCR glyphs PaddleOCR emits for stencil strokes.
+# Known broken-OCR glyphs that OCR engines (PaddleOCR historically, GLM-OCR
+# today) emit when they misread stencil strokes.
 _SUSPICIOUS_PATTERN = re.compile(r"[텅딥밉법봐릉\ufffd]|\?{2,}|-{3,}")
 
 # Simple OCR-artifact chars used by score_text_quality.
@@ -301,7 +302,7 @@ def suspicious_ratio(text: str) -> float:
     """Fraction of the text occupied by known OCR-garbage patterns.
 
     Counts matches of :data:`_SUSPICIOUS_PATTERN` (Korean look-alike glyphs
-    PaddleOCR emits for stencil strokes, runs of ``?`` / ``-``, unicode
+    OCR engines emit for stencil strokes, runs of ``?`` / ``-``, unicode
     replacement character) divided by total char count.
 
     The parser selector refuses ``question_number_parser`` when this exceeds
@@ -470,7 +471,7 @@ def _classify_page_from_dict(data: dict) -> PageKind:
     superscript digits were separate spans (e.g. "x" then "2") and
     ``_MATH_SIGNAL_RE`` never matched across the span boundary, causing
     math-heavy answer-key pages to be mis-classified as ``"image"`` and
-    sent to PaddleOCR unnecessarily.
+    sent to the OCR engine unnecessarily.
     """
     parts: list[str] = []
     for block in data.get("blocks", []) or []:

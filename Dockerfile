@@ -43,6 +43,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Build-time system dependencies:
 #   * build-essential / gcc  - compile psycopg2 / protobuf fallbacks
 #   * libpq-dev              - headers for psycopg2 (belt & suspenders)
+#   * git                    - `pip install git+https://.../transformers.git`
+#                              (GLM-OCR requires the transformers dev head)
 #   * curl, ca-certificates  - fetch pip/wheel indexes over HTTPS
 # We purposely do NOT install these into the runtime image.
 RUN apt-get update \
@@ -50,6 +52,7 @@ RUN apt-get update \
         build-essential \
         gcc \
         libpq-dev \
+        git \
         curl \
         ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -64,13 +67,15 @@ WORKDIR /build
 # don't.
 COPY requirements.txt ./
 
-# Install torch first, from the correct wheel index, so the transitive
-# torch pulled in by `sentence-transformers` / `transformers` does not
-# override it with a different CUDA build.
+# Install torch (and torchvision, which transformers' AutoVideoProcessor
+# needs at import time for Qwen2.5-VL) first, from the correct wheel
+# index, so the transitive torch pulled in by `sentence-transformers` /
+# `transformers` does not override it with a different CUDA build.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --index-url "${TORCH_INDEX_URL}" \
         --extra-index-url https://pypi.org/simple \
-        "torch>=2.1.0"
+        "torch>=2.1.0" \
+        "torchvision>=0.16.0"
 
 # Install everything else. `torch` is already satisfied so pip will skip it.
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -86,17 +91,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
-    # Keep HuggingFace / Torch / Paddle caches inside a writable volume
-    # mount so models survive container restarts.
+    # Keep HuggingFace / Torch caches inside a writable volume mount so
+    # models (Qwen2.5-VL, GLM-OCR, sentence-transformers) survive
+    # container restarts.
     HF_HOME=/app/.cache/huggingface \
     TRANSFORMERS_CACHE=/app/.cache/huggingface \
-    TORCH_HOME=/app/.cache/torch \
-    PADDLE_HOME=/app/.cache/paddle
+    TORCH_HOME=/app/.cache/torch
 
 # Runtime shared libraries:
 #   * libpq5                     - psycopg2 runtime
-#   * libgl1, libglib2.0-0       - OpenCV / PaddleOCR / PyMuPDF rendering
-#   * libgomp1                   - OpenMP for torch / paddle
+#   * libgl1, libglib2.0-0       - Pillow/OpenCV/PyMuPDF image rendering
+#   * libgomp1                   - OpenMP for torch
 #   * libstdc++6, libgcc-s1      - C++ runtime for torch
 #   * curl                       - HEALTHCHECK probe
 #   * tini                       - proper PID 1 / signal forwarding

@@ -21,11 +21,27 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# ---------------------------------------------------------------------------
+# Push ``.env`` into ``os.environ`` so BOTH pydantic-settings (which reads
+# from its own env_file path) AND every ``os.getenv(...)`` call scattered
+# across the app (``grading_service``, ``ocr_service``, ...) see the same
+# values. ``pydantic-settings`` alone does NOT populate ``os.environ``,
+# which is a common footgun: env-var toggles like
+# ``GRADING_FINAL_ANSWER_SAFETY_NET=0`` or ``GLM_OCR_BASE_URL=...`` silently
+# fall back to their code-level defaults unless we do this explicitly.
+#
+# ``override=False`` respects any var already set in the shell / container
+# environment (docker-compose, CI, direct ``$env:FOO=...`` in PowerShell)
+# so operators can override individual vars without editing the file.
+# ---------------------------------------------------------------------------
+load_dotenv(dotenv_path=_PROJECT_ROOT / ".env", override=False)
 
 
 class Settings(BaseSettings):

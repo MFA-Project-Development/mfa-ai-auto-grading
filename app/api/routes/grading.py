@@ -3,9 +3,15 @@
 Exposes the auto-detect grading routes
 (``POST /api/v1/grading/submit-by-image`` and
 ``POST /api/v1/grading/submit-multi-by-image``) that accept a handwritten
-answer image plus a ``file_id`` and return machine-generated grades
-produced by Qwen2.5-VL-7B-Instruct (see
-:mod:`app.services.grading_service`).
+answer image plus a ``file_id`` and return machine-generated grades.
+Grading is produced by a two-stage pipeline (see
+:mod:`app.services.grading_service`):
+
+1. ``zai-org/GLM-OCR`` transcribes the handwriting to plain text.
+2. ``Qwen/Qwen2.5-VL-7B-Instruct`` (text-only, bnb 4-bit) grades
+   the transcription against the retrieved answer key - acting as
+   the generation step of a RAG pipeline whose retrieval is handled
+   by :mod:`app.services.question_resolver`.
 
 Authorisation
 -------------
@@ -65,9 +71,9 @@ router = APIRouter(prefix="/api/v1/grading", tags=["Grading"])
 
 # --------------------------------------------------------------------- constants
 
-# 10 MiB upper bound on inbound images. Qwen2.5-VL tokenises images into
-# variable-length visual token sequences; oversized inputs can easily
-# blow past the model's context window *and* the GPU allocator.
+# 10 MiB upper bound on inbound images. GLM-OCR resizes inputs
+# internally, but oversized payloads still pressure the tempfile +
+# Pillow decode path and should be rejected early.
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 # Whitelist of inbound content types. We intentionally do NOT trust the
@@ -91,11 +97,12 @@ _MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
     (b"RIFF", "image/webp"),  # followed by 'WEBP' at offset 8
 )
 
-# ``/submit-by-image`` does two Qwen passes (identify then grade) and
-# needs a generous end-to-end budget. The identify pass is cheap
-# (~2-5s) but the grading pass can still take 30-60s on a cold GPU;
-# 180s gives both rooms without being so long that stuck requests back
-# up the executor pool. ``/submit-multi-by-image`` reuses the same
+# ``/submit-by-image`` does one GLM-OCR pass plus one Qwen text-grading
+# pass (and optionally one Qwen text-identify pass) and needs a
+# generous end-to-end budget. GLM-OCR takes 5-20s depending on page
+# density; Qwen's text-only grading pass is 10-30s. 180s gives both
+# plenty of room without being so long that stuck requests back up
+# the executor pool. ``/submit-multi-by-image`` reuses the same
 # per-question budget, capped by ``_MAX_QUESTIONS_PER_IMAGE``.
 _GRADING_BY_IMAGE_TIMEOUT_SECONDS = float(
     os.getenv("GRADING_BY_IMAGE_TIMEOUT_SECONDS", "180")
@@ -183,10 +190,11 @@ class GradingResponse(BaseModel):
         default=False,
         description=(
             "True when the final-answer safety net had to upgrade this "
-            "response to full marks - i.e. the VLM flagged one or more "
-            "intermediate steps but the student's last-line transcription "
-            "matched the expected final answer, so we awarded credit for "
-            "the correct result despite per-step OCR uncertainty. "
+            "response to full marks - i.e. the grading LLM flagged one "
+            "or more intermediate steps but the student's last-line "
+            "transcription matched the expected final answer, so we "
+            "awarded credit for the correct result despite per-step "
+            "OCR uncertainty. "
             "Frontends should render a 'teacher review recommended' badge "
             "when this is True."
         ),

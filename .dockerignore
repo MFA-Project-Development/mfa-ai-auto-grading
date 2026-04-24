@@ -61,10 +61,9 @@ models
 *.onnx
 *.ckpt
 
-# HuggingFace / Torch / PaddleOCR caches
+# HuggingFace / Torch caches
 .cache
 .huggingface
-.paddleocr
 
 # Test & coverage artifacts
 tests

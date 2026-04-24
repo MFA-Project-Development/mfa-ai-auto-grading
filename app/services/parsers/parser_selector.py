@@ -7,8 +7,8 @@ to handle parsing errors themselves.
 Selection is **quality-aware**: structured parsers (``question_number`` and
 ``heading``) are only picked when the prepared page texts are clean enough
 to chunk safely. When text quality is low - typical for OCR'd image PDFs
-where PaddleOCR lands the digits but corrupts the math - we fall back to
-the page parser instead of emitting corrupted structured chunks.
+where the OCR engine lands the digits but corrupts the math - we fall back
+to the page parser instead of emitting corrupted structured chunks.
 
 Gates:
 

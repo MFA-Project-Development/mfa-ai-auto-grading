@@ -107,6 +107,13 @@ services:
       # we advertise the host port MinIO is published on.
       MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-localhost:${MINIO_API_PORT:-9000}}
       MINIO_SECURE: "false"
+      # vLLM (GLM-OCR) runs in its own container that publishes port 8080
+      # on the host. From inside this container, "localhost" is the
+      # container itself, so we reach the host gateway instead. Override
+      # GLM_OCR_BASE_URL_DOCKER in .env to point somewhere else (e.g.
+      # another compose service on a shared external network, in which
+      # case use that service name, not host.docker.internal).
+      GLM_OCR_BASE_URL: ${GLM_OCR_BASE_URL_DOCKER:-http://host.docker.internal:8080/v1}
       # Alembic runs on startup via docker-entrypoint.sh; AUTO_CREATE_DB
       # is the FastAPI lifespan fallback and stays off in production.
       AUTO_CREATE_DB: "0"
@@ -124,21 +131,29 @@ services:
     volumes:
       # Persist the ChromaDB vector store across container restarts.
       - chroma_data:/app/chroma_db
-      # Cache downloaded HuggingFace / Torch / Paddle models so a
+      # Cache downloaded HuggingFace / Torch models (Qwen2.5-VL, GLM-OCR,
+      # sentence-transformers) so a
       # redeploy doesn't re-download multi-GB weights.
       - model_cache:/app/.cache
       # Optional local upload fallback (used only when STORAGE_DIR is set).
       - uploads_data:/app/uploads
     networks:
       - mfa-network
-    # Uncomment to expose the host NVIDIA GPU to the VLM.
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+    # Docker Desktop (Windows/Mac) resolves host.docker.internal
+    # automatically; on Linux we need this mapping so the api container
+    # can reach services published on the host (e.g. the vLLM container).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Expose the host NVIDIA GPU to the VLM. Requires Docker Desktop on
+    # Windows with WSL2 + a recent NVIDIA Windows driver, or the NVIDIA
+    # Container Toolkit on Linux hosts.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
 volumes:
   postgres_data:

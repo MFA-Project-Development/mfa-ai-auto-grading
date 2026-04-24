@@ -71,10 +71,9 @@ logs/
 *.onnx
 *.ckpt
 
-# Hugging Face / Torch / PaddleOCR caches
+# Hugging Face / Torch caches
 .cache/
 .huggingface/
-.paddleocr/
 
 # ---------------------------------------------------------------------------
 # Alembic (keep versions/, ignore only local SQL dumps if any)
