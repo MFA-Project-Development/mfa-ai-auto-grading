@@ -160,6 +160,79 @@ _GRADING_PREPROCESS: bool = os.getenv("GRADING_PREPROCESS_IMAGES", "1") == "1"
 # to 0 because the resolver already supplies the best single chunk.
 _RAG_EXTRA_TOP_K: int = int(os.getenv("GRADING_RAG_EXTRA_TOP_K", "0"))
 
+# Default language used for the natural-language feedback fields the
+# model emits (``feedback``, ``error_summary``, ``extracted_steps[].error``).
+# Math expressions, JSON keys, ``student_wrote`` / ``expected``, and
+# all numeric/boolean fields are unaffected - only the human-readable
+# prose the student sees switches language.
+#
+# This is now ONLY a fallback default: every grading call accepts an
+# explicit ``feedback_language`` parameter (the route layer surfaces
+# it on the HTTP request body), and that takes precedence. The env
+# var still controls what happens when the caller omits the field.
+#
+# Defaults to Korean because the deployment is for Korean students;
+# set ``GRADING_FEEDBACK_LANGUAGE=english`` to flip the fallback. Both
+# ``korean`` and ``english`` (plus the short aliases below) are accepted.
+_DEFAULT_FEEDBACK_LANGUAGE_RAW: str = (
+    os.getenv("GRADING_FEEDBACK_LANGUAGE", "korean").strip().lower()
+)
+
+# Canonical language names used everywhere downstream. Keep the set
+# tiny and explicit so a typo on the request body does not silently
+# fall through to "English by accident".
+_LANGUAGE_KOREAN: str = "korean"
+_LANGUAGE_ENGLISH: str = "english"
+_SUPPORTED_FEEDBACK_LANGUAGES: frozenset[str] = frozenset(
+    {_LANGUAGE_KOREAN, _LANGUAGE_ENGLISH}
+)
+
+# Free-form aliases callers may send on the request body. Map them to
+# the two canonical names above.
+_LANGUAGE_ALIASES: dict[str, str] = {
+    "korean": _LANGUAGE_KOREAN,
+    "ko": _LANGUAGE_KOREAN,
+    "kr": _LANGUAGE_KOREAN,
+    "ko-kr": _LANGUAGE_KOREAN,
+    "ko_kr": _LANGUAGE_KOREAN,
+    "kor": _LANGUAGE_KOREAN,
+    "한국어": _LANGUAGE_KOREAN,
+    "english": _LANGUAGE_ENGLISH,
+    "en": _LANGUAGE_ENGLISH,
+    "en-us": _LANGUAGE_ENGLISH,
+    "en_us": _LANGUAGE_ENGLISH,
+    "eng": _LANGUAGE_ENGLISH,
+}
+
+
+def _normalize_feedback_language(value: str | None) -> str:
+    """Coerce an arbitrary user-supplied string to a canonical language name.
+
+    Accepts ``None`` (returns the env-driven default), case-insensitive
+    aliases (``"ko"``, ``"KR"``, ``"english"``, ``"en"``...), or the
+    canonical names directly. Unknown / empty values fall through to
+    the env-driven default rather than raising, so a typo in a request
+    body is forgiving.
+
+    Returns one of :data:`_LANGUAGE_KOREAN` / :data:`_LANGUAGE_ENGLISH`.
+    """
+    if value is None:
+        candidate = _DEFAULT_FEEDBACK_LANGUAGE_RAW
+    else:
+        candidate = str(value).strip().lower()
+    resolved = _LANGUAGE_ALIASES.get(candidate)
+    if resolved is None:
+        # Last-ditch: maybe somebody set the env var to garbage too.
+        resolved = _LANGUAGE_ALIASES.get(_DEFAULT_FEEDBACK_LANGUAGE_RAW, _LANGUAGE_KOREAN)
+    return resolved
+
+
+# Resolved canonical default - convenient shortcut for module-level
+# code paths (e.g. background tasks) that don't have a request context.
+_DEFAULT_FEEDBACK_LANGUAGE: str = _normalize_feedback_language(
+    _DEFAULT_FEEDBACK_LANGUAGE_RAW
+)
+
 # ----- Final-answer safety net ------------------------------------------------
 # The safety net in ``_repair_final_answer_match`` upgrades a response to
 # full-marks when the expected final answer appears in one of the VLM's
@@ -295,12 +368,73 @@ is the most common failure mode; guard against it explicitly."""
 
 # --------------------------------------------------------------------- prompt
 
-_SYSTEM_PROMPT: str = (
+# The base system prompt is language-agnostic. The actual per-call
+# system prompt is built by ``_system_prompt_for(language)`` below,
+# which appends a language directive when the caller asked for
+# Korean output. The English path uses the base string as-is.
+_SYSTEM_PROMPT_BASE: str = (
     "You are a math teacher grading a student's solution. The student's "
     "handwritten work has already been OCR-transcribed for you. Compare "
     "the transcription line-by-line against the answer key and produce "
     "structured JSON feedback."
 )
+
+_SYSTEM_PROMPT_KOREAN_SUFFIX: str = (
+    " IMPORTANT: write all natural-language fields in Korean (한국어): "
+    "the top-level `feedback`, every `extracted_steps[].error`, and "
+    "`error_summary`. Math expressions, JSON keys, numeric values, "
+    "and the contents of `student_wrote` / `expected` stay verbatim - "
+    "only the human-readable prose fields are Korean. Examples in "
+    "the user prompt show English prose for clarity, but your output "
+    "MUST use Korean for those three fields."
+)
+
+# Reinforcing directive appended to the user prompt for the Korean path.
+# The system prompt already binds the instruction once; we repeat it at
+# the END of the user prompt because Qwen2.5-VL empirically follows the
+# most-recent in-context instruction more reliably than the system-prompt
+# one when the user prompt itself contains long English example output.
+_LANGUAGE_DIRECTIVE_KOREAN: str = """
+
+LANGUAGE REQUIREMENT (overrides example prose below):
+- Write the following fields in Korean (한국어):
+    * top-level ``feedback``
+    * each ``extracted_steps[].error``
+    * ``error_summary``
+- Math expressions, equation content, JSON keys, numeric values, and
+  the strings inside ``student_wrote`` / ``expected`` stay verbatim
+  - do NOT translate math into Korean.
+- The example JSON further down shows English prose for clarity only.
+  YOUR ``feedback`` / ``error`` / ``error_summary`` text MUST be Korean
+  even though the example is English.
+"""
+
+
+def _system_prompt_for(language: str) -> str:
+    """Return the system prompt to use for a given canonical language."""
+    if language == _LANGUAGE_KOREAN:
+        return _SYSTEM_PROMPT_BASE + _SYSTEM_PROMPT_KOREAN_SUFFIX
+    return _SYSTEM_PROMPT_BASE
+
+
+def _language_directive_for(language: str) -> str:
+    """Return the user-prompt language directive to append for a language.
+
+    English is the default of the example prompt's example output, so
+    no directive is needed - returns an empty string. Korean returns
+    the reinforcing block.
+    """
+    if language == _LANGUAGE_KOREAN:
+        return _LANGUAGE_DIRECTIVE_KOREAN
+    return ""
+
+
+# Backwards-compat shim: a few module-level callers (and the test
+# suite) import ``_SYSTEM_PROMPT`` directly. Resolve it once against
+# the env-driven default so existing imports keep working without
+# having to know about the per-call selection. New code should call
+# ``_system_prompt_for(language)``.
+_SYSTEM_PROMPT: str = _system_prompt_for(_DEFAULT_FEEDBACK_LANGUAGE)
 
 # Double-braces ({{ / }}) are str.format escapes for literal { / }.
 # Single-braced {transcription}, {question}, {answer_key}, {max_score},
@@ -946,6 +1080,8 @@ def _retrieve_grading_context(
 def _parse_json_response(
     raw: str,
     required_fields: frozenset[str] | None = None,
+    *,
+    feedback_language: str | None = None,
 ) -> dict[str, Any]:
     """Turn the model's raw output into a validated dict.
 
@@ -1026,8 +1162,11 @@ def _parse_json_response(
                 "head=%r",
                 stripped[:160],
             )
-            data["feedback"] = (
-                data.get("error_summary") or "See step breakdown."
+            language = _normalize_feedback_language(feedback_language)
+            data["feedback"] = data.get("error_summary") or (
+                "단계별 풀이 내역을 확인해 주세요."
+                if language == _LANGUAGE_KOREAN
+                else "See step breakdown."
             )
 
     return data
@@ -1314,6 +1453,7 @@ def _repair_final_answer_match(
     transcription: str | None = None,
     question: str | None = None,
     question_label: str | None = None,
+    feedback_language: str | None = None,
 ) -> None:
     """Safety net: if the extracted final step matches the expected final
     answer AND the answer also appears in the raw OCR transcription, upgrade
@@ -1629,12 +1769,21 @@ def _repair_final_answer_match(
     # with a clear single-sentence statement that will not contradict the
     # top-level verdict.
     original_feedback = str(data.get("feedback") or "").strip()
-    data["feedback"] = (
-        f"Full marks: the student reached the correct final answer "
-        f"({expected_final_answer}). Any intermediate-step uncertainty "
-        f"flagged during transcription was resolved in the student's "
-        f"favour because the final result is correct."
-    )
+    language = _normalize_feedback_language(feedback_language)
+    if language == _LANGUAGE_KOREAN:
+        data["feedback"] = (
+            f"만점입니다: 학생이 올바른 최종 답({expected_final_answer})에 "
+            f"도달했습니다. 풀이 중간에 OCR 인식 과정에서 불확실하게 "
+            f"표시된 단계가 있었으나 최종 결과가 정답이므로 학생에게 "
+            f"유리하게 처리하였습니다."
+        )
+    else:
+        data["feedback"] = (
+            f"Full marks: the student reached the correct final answer "
+            f"({expected_final_answer}). Any intermediate-step uncertainty "
+            f"flagged during transcription was resolved in the student's "
+            f"favour because the final result is correct."
+        )
 
     # --- Audit logging ---------------------------------------------------
     if was_score != max_score or not was_is_correct or not was_method_correct:
@@ -1843,12 +1992,26 @@ _QWEN_SAYS_ALL_CORRECT_RE = re.compile(
     r"\ball\s+(?:the\s+)?steps?\s+(?:are\s+)?correct\b"
     r"|\ball\s+correct\b"
     r"|\bno\s+errors?\s+(?:were\s+)?(?:detected|found|present)\b"
-    r"|\bcorrectly\s+(?:expanded|simplified|solved|computed)\b",
+    r"|\bcorrectly\s+(?:expanded|simplified|solved|computed)\b"
+    # Korean equivalents - kept loose because Korean inflects verbs
+    # and may attach particles (이/가/는/은/도) directly to the noun.
+    r"|모든\s*단계(?:가|는|이|은|도)?\s*(?:올바|정확|맞)"
+    r"|모두\s*(?:정답|맞|올바|정확)"
+    r"|전부\s*(?:정답|맞|올바|정확)"
+    r"|오류(?:가|는|이|은)?\s*(?:없|찾을\s*수\s*없)"
+    r"|(?:올바르게|정확하게|제대로)\s*(?:전개|계산|풀이|풀었|풀이했|구했|구했습)"
+    r"|정답입니다"
+    r"|모두\s*맞았",
     re.IGNORECASE,
 )
 
 _QWEN_EMPTY_SUMMARY_RE = re.compile(
-    r"^\s*(?:none|null|no\s+errors?(?:\s+detected|\s+found)?|n/?a)\s*\.?\s*$",
+    r"^\s*(?:"
+    r"none|null|no\s+errors?(?:\s+detected|\s+found)?|n/?a"
+    # Korean equivalents the model emits when it judges "no error":
+    # "없음" (none), "오류 없음" (no errors), "해당 없음" (not applicable).
+    r"|없음|오류\s*없음|해당\s*없음|없습니다"
+    r")\s*\.?\s*$",
     re.IGNORECASE,
 )
 
@@ -1970,6 +2133,8 @@ def _reconcile_qwen_self_contradiction(
 def _reconcile_top_level_feedback_with_steps(
     data: dict[str, Any],
     expected_final_answer: str | None,
+    *,
+    feedback_language: str | None = None,
 ) -> None:
     """Rewrite ``error_summary`` and ``feedback`` to match the step verdict.
 
@@ -2000,6 +2165,8 @@ def _reconcile_top_level_feedback_with_steps(
     ]
 
     feedback = str(data.get("feedback") or "")
+    language = _normalize_feedback_language(feedback_language)
+    is_korean = language == _LANGUAGE_KOREAN
 
     if not wrong_steps:
         # All steps now correct. Make the prose consistent.
@@ -2008,10 +2175,16 @@ def _reconcile_top_level_feedback_with_steps(
             tail = (
                 f" ({expected_final_answer})" if expected_final_answer else ""
             )
-            data["feedback"] = (
-                f"All steps are correct. The student reached the correct "
-                f"final answer{tail}."
-            )
+            if is_korean:
+                data["feedback"] = (
+                    f"모든 단계가 올바릅니다. 학생이 올바른 최종 답"
+                    f"{tail}에 도달했습니다."
+                )
+            else:
+                data["feedback"] = (
+                    f"All steps are correct. The student reached the correct "
+                    f"final answer{tail}."
+                )
             logger.info(
                 "grading: reconciled feedback for all-correct case "
                 "(was=%r now=%r)",
@@ -2026,15 +2199,29 @@ def _reconcile_top_level_feedback_with_steps(
     # is correct, regenerate both text fields from the per-step errors.
     if _qwen_says_all_correct(data):
         parts: list[str] = []
+        # ``error`` strings from the model are already in the requested
+        # feedback language (the prompt told it which one to use), so
+        # we only need to localise the "Step N:" / "{n} step(s)"
+        # connector text here.
+        step_label = "단계 {sn}:" if is_korean else "Step {sn}:"
         for ws in wrong_steps:
             sn = ws.get("step_number")
             err = str(ws.get("error") or "").strip()
             if err:
-                parts.append(f"Step {sn}: {err}" if sn is not None else err)
+                if sn is not None:
+                    parts.append(f"{step_label.format(sn=sn)} {err}")
+                else:
+                    parts.append(err)
 
         if parts:
             new_feedback = " ".join(parts)[:2000]
             new_summary = parts[0][:400]
+        elif is_korean:
+            new_feedback = (
+                f"{len(wrong_steps)}개의 단계에서 오류가 발견되었습니다. "
+                f"단계별 상세 내용을 확인해 주세요."
+            )
+            new_summary = new_feedback
         else:
             new_feedback = (
                 f"{len(wrong_steps)} step(s) contain errors; please "
@@ -2303,6 +2490,7 @@ def _build_messages(
     question_label: str | None = None,
     other_questions_on_page: list[str] | None = None,
     retrieval_context: list[str] | None = None,
+    feedback_language: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build the Qwen chat-template messages for one grading call.
 
@@ -2439,11 +2627,20 @@ def _build_messages(
         label_hint=label_hint,
         retrieval_block=retrieval_block,
     )
+
+    # Language directive is appended to the END of the user prompt so
+    # it sits AFTER the example JSON (which is always English) - the
+    # model follows the most-recent in-context instruction more
+    # reliably than the system-prompt one when the example is verbose.
+    # ``_strict_retry`` (parse-failure retry) goes after the language
+    # directive: parse-correctness wins over language preference.
+    language = _normalize_feedback_language(feedback_language)
+    user_prompt = user_prompt + _language_directive_for(language)
     if strict_retry:
         user_prompt = user_prompt + _STRICT_RETRY_SUFFIX
 
     return [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": _system_prompt_for(language)},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -2599,6 +2796,7 @@ def _grade_sync(
     other_questions_on_page: list[str] | None = None,
     file_id: str | None = None,
     retrieval_context: list[str] | None = None,
+    feedback_language: str | None = None,
 ) -> dict[str, Any]:
     """Blocking implementation of :func:`grade_answer`.
 
@@ -2673,6 +2871,12 @@ def _grade_sync(
             "Grading model is not loaded (see startup logs for details)."
         )
 
+    # Resolve the per-call feedback language ONCE up front so every
+    # downstream branch (prompt build, repair helpers, fallback strings)
+    # sees the same canonical value. ``None`` falls through to the
+    # env-driven default.
+    resolved_language = _normalize_feedback_language(feedback_language)
+
     pil_image = _decode_image(image_bytes)
 
     # --- OCR stage (GLM-OCR) ----------------------------------------------
@@ -2733,11 +2937,16 @@ def _grade_sync(
             question_label=question_label,
             other_questions_on_page=other_questions_on_page,
             retrieval_context=effective_retrieval,
+            feedback_language=resolved_language,
         )
         raw = _run_generation(messages)
 
         try:
-            data = _parse_json_response(raw, required_fields=_GRADING_REQUIRED_FIELDS)
+            data = _parse_json_response(
+                raw,
+                required_fields=_GRADING_REQUIRED_FIELDS,
+                feedback_language=resolved_language,
+            )
             parse_success = True
         except (ValueError, json.JSONDecodeError) as exc:
             logger.warning(
@@ -2755,11 +2964,14 @@ def _grade_sync(
                 question_label=question_label,
                 other_questions_on_page=other_questions_on_page,
                 retrieval_context=effective_retrieval,
+                feedback_language=resolved_language,
             )
             raw = _run_generation(messages)
             try:
                 data = _parse_json_response(
-                    raw, required_fields=_GRADING_REQUIRED_FIELDS
+                    raw,
+                    required_fields=_GRADING_REQUIRED_FIELDS,
+                    feedback_language=resolved_language,
                 )
                 parse_success = True
             except (ValueError, json.JSONDecodeError) as exc2:
@@ -2828,6 +3040,7 @@ def _grade_sync(
         transcription=transcription,
         question=question,
         question_label=question_label,
+        feedback_language=resolved_language,
     )
     _reconcile_qwen_self_contradiction(
         data,
@@ -2846,7 +3059,9 @@ def _grade_sync(
     )
 
     _validate_score(data, max_score)
-    _reconcile_top_level_feedback_with_steps(data, expected_final_answer)
+    _reconcile_top_level_feedback_with_steps(
+        data, expected_final_answer, feedback_language=resolved_language
+    )
     extracted_steps = _sanitize_steps(data.get("extracted_steps"))
 
     total_steps = len(extracted_steps)
@@ -2915,6 +3130,7 @@ async def grade_answer(
     other_questions_on_page: list[str] | None = None,
     file_id: str | None = None,
     retrieval_context: list[str] | None = None,
+    feedback_language: str | None = None,
 ) -> dict[str, Any]:
     """Grade a single handwritten answer image.
 
@@ -2986,6 +3202,14 @@ async def grade_answer(
         reference material. When ``None`` and
         ``GRADING_RAG_EXTRA_TOP_K > 0``, the grader performs its own
         bge-m3 + Chroma retrieval hop keyed off the OCR'd transcription.
+    feedback_language:
+        Per-request override for the natural-language fields the model
+        emits (``feedback``, ``error_summary``, every
+        ``extracted_steps[].error``). Accepts ``"korean"`` / ``"ko"``
+        / ``"kr"`` / ``"english"`` / ``"en"`` (case-insensitive). When
+        ``None`` (or unrecognised), falls through to the env-driven
+        ``GRADING_FEEDBACK_LANGUAGE`` default. Math expressions, JSON
+        keys, and numeric values are unaffected by this setting.
 
     Returns
     -------
@@ -3026,6 +3250,7 @@ async def grade_answer(
                 other_questions_on_page,
                 file_id,
                 retrieval_context,
+                feedback_language,
             ),
             timeout=_GRADING_TIMEOUT_S,
         )

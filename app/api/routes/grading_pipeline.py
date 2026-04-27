@@ -167,6 +167,14 @@ class GradingPipelineRequest(BaseModel):
     bulk update to trip a ``pointsAwarded > maxPoints`` check on the
     upstream, so the API now treats the upstream's declared max as the
     authority.
+
+    ``feedback_language`` controls the language of the natural-language
+    fields the grader emits (the top-level ``feedback`` string, every
+    ``extracted_steps[].error``, and ``error_summary``). Math
+    expressions, JSON keys, numeric values, and ``student_wrote`` /
+    ``expected`` are unaffected by this setting. When omitted, the
+    server falls back to the ``GRADING_FEEDBACK_LANGUAGE`` env var
+    (default ``"korean"``).
     """
 
     assessment_id: uuid.UUID
@@ -174,6 +182,17 @@ class GradingPipelineRequest(BaseModel):
     file_id: uuid.UUID = Field(
         ...,
         description="AnswerKeyFile UUID holding the local answer-key for this assessment.",
+    )
+    feedback_language: str | None = Field(
+        default=None,
+        description=(
+            "Language for the natural-language fields the grader emits "
+            "(`feedback`, `error_summary`, every `extracted_steps[].error`). "
+            "Accepted values (case-insensitive): `korean`, `ko`, `kr`, "
+            "`english`, `en`. Math/JSON/numeric content is unaffected. "
+            "Omit to use the server-side default (`GRADING_FEEDBACK_LANGUAGE`)."
+        ),
+        examples=["korean", "english"],
     )
 
 
@@ -222,6 +241,11 @@ class PipelineAnswerResult(BaseModel):
     points_awarded: float | None = None
     annotation_id: uuid.UUID | None = None
     feedback_id: uuid.UUID | None = None
+    # Whether the annotation/feedback was newly created or an existing
+    # one was updated in-place. ``None`` means we never reached that
+    # step (e.g. ``no_grade_matched`` or "student got it right" skip).
+    annotation_action: Literal["created", "updated"] | None = None
+    feedback_action: Literal["created", "updated"] | None = None
     status: Literal[
         "graded",
         "no_grade_matched",
@@ -246,7 +270,9 @@ class GradingPipelineResponse(BaseModel):
     answers_fetched: int
     answers_matched: int
     annotations_created: int
+    annotations_updated: int
     feedbacks_created: int
+    feedbacks_updated: int
     bulk_update_applied: bool
 
     papers: list[PipelinePaperResult] = Field(default_factory=list)
@@ -289,6 +315,57 @@ def _normalise_question_no(value: str | None) -> str | None:
     return digits.lstrip("0").zfill(4) or "0000"
 
 
+async def _fetch_latest_existing_id(
+    client: AssessmentAPIClient,
+    *,
+    path: str,
+    id_field: str,
+    token: str,
+) -> str | None:
+    """Return the most recent record's ID for an answer-scoped collection.
+
+    Used to decide whether ``POST /answers/{aid}/{collection}`` should
+    be re-issued or upgraded to ``PUT /answers/{aid}/{collection}/{id}``
+    so re-running the grader does not pile up duplicate annotation /
+    feedback rows on the same answer.
+
+    Returns ``None`` on any error (network, parse, empty list) - the
+    caller will then fall back to the create path, which is the same
+    behaviour the pipeline had before this idempotency check existed.
+    """
+    try:
+        resp = await client.get_json(
+            path,
+            params={
+                "page": 1,
+                "size": 1,
+                "property": "CREATED_AT",
+                "direction": "DESC",
+            },
+            headers=_bearer(token),
+        )
+    except (AssessmentAPIError, AssessmentAPIStatusError) as exc:
+        logger.warning(
+            "pipeline: failed to look up existing %s at %s: %s",
+            id_field,
+            path,
+            exc,
+        )
+        return None
+
+    items = _unwrap_items(resp)
+    if not items:
+        return None
+
+    # The list endpoints sort DESC by created_at by default, so the
+    # head of the list is the freshest record - that is the one we
+    # want to update so historical ordering is preserved.
+    raw = items[0].get(id_field) or items[0].get("id")
+    if not raw:
+        return None
+    return str(raw)
+
+
 async def _download_paper(
     client: AssessmentAPIClient,
     filename: str,
@@ -312,6 +389,7 @@ async def _grade_paper(
     file_id: uuid.UUID,
     image_bytes: bytes,
     max_points_by_qno: dict[str, int],
+    feedback_language: str | None = None,
 ) -> list[GradedQuestionTrace]:
     """Run identify + resolve + grade over one paper image.
 
@@ -427,6 +505,7 @@ async def _grade_paper(
                     # by GRADING_RAG_EXTRA_TOP_K in grading_service) to the
                     # answer-key file the student is being graded against.
                     file_id=str(match_result.item.file_id),
+                    feedback_language=feedback_language,
                 ),
                 timeout=_PER_PAPER_GRADING_TIMEOUT_SECONDS,
             )
@@ -570,11 +649,13 @@ async def run_pipeline(
     and per answer - a single failure does not abort the whole run.
     """
     logger.info(
-        "pipeline: start user=%s assessment=%s submission=%s file=%s",
+        "pipeline: start user=%s assessment=%s submission=%s file=%s "
+        "feedback_language=%s",
         user.preferred_username or user.sub,
         payload.assessment_id,
         payload.submission_id,
         payload.file_id,
+        payload.feedback_language or "(server default)",
     )
 
     try:
@@ -708,6 +789,7 @@ async def _run(
             file_id=payload.file_id,
             image_bytes=image_bytes,
             max_points_by_qno=max_points_by_qno,
+            feedback_language=payload.feedback_language,
         )
         result.graded_questions = traces
         raw_grades_by_paper[result.paper_id] = [t.model_dump() for t in traces]
@@ -777,7 +859,9 @@ async def _run(
     )
 
     annotations_created = 0
+    annotations_updated = 0
     feedbacks_created = 0
+    feedbacks_updated = 0
 
     # Resolve raw grade dicts keyed by (paper_id, matched_question_no)
     # so we can attach extracted_steps to the annotation body.
@@ -788,7 +872,8 @@ async def _run(
             raw_by_match[key] = raw
 
     async def _annotate_and_feedback(row: PipelineAnswerResult) -> None:
-        nonlocal annotations_created, feedbacks_created
+        nonlocal annotations_created, annotations_updated
+        nonlocal feedbacks_created, feedbacks_updated
 
         if row.points_awarded is None or row.matched_paper_id is None:
             return
@@ -834,21 +919,55 @@ async def _run(
             raw_grade=raw_grade,
         )
 
+        # ----- Idempotent annotation + feedback -----
+        # If the answer already has an annotation / feedback (e.g. the
+        # instructor is re-running the auto-grader on the same
+        # submission), upgrade ``POST`` to ``PUT`` against the existing
+        # record instead of stacking duplicates. Both lookups are
+        # issued in parallel because they hit independent endpoints.
+        existing_ann_id, existing_fb_id = await asyncio.gather(
+            _fetch_latest_existing_id(
+                client,
+                path=f"answers/{row.answer_id}/annotations",
+                id_field="annotationId",
+                token=token,
+            ),
+            _fetch_latest_existing_id(
+                client,
+                path=f"answers/{row.answer_id}/feedbacks",
+                id_field="feedbackId",
+                token=token,
+            ),
+        )
+
         try:
-            ann_resp = await client.post_json(
-                f"answers/{row.answer_id}/annotations",
-                json={"contentJson": content_json},
-                headers=_bearer(token),
-            )
+            if existing_ann_id:
+                ann_resp = await client.put_json(
+                    f"answers/{row.answer_id}/annotations/{existing_ann_id}",
+                    json={"contentJson": content_json},
+                    headers=_bearer(token),
+                )
+            else:
+                ann_resp = await client.post_json(
+                    f"answers/{row.answer_id}/annotations",
+                    json={"contentJson": content_json},
+                    headers=_bearer(token),
+                )
         except AssessmentAPIError as exc:
             row.status = "annotation_failed"
             row.error = f"annotation: {exc}"
             return
 
         payload_dict = (ann_resp or {}).get("payload") if isinstance(ann_resp, dict) else None
-        annotation_id_raw = None
+        annotation_id_raw: Any = None
         if isinstance(payload_dict, dict):
-            annotation_id_raw = payload_dict.get("annotationId") or payload_dict.get("id")
+            annotation_id_raw = (
+                payload_dict.get("annotationId") or payload_dict.get("id")
+            )
+        # Some upstreams omit the body on PUT (204-like) or echo only a
+        # status envelope - fall back to the ID we used in the URL.
+        if not annotation_id_raw and existing_ann_id:
+            annotation_id_raw = existing_ann_id
         if not annotation_id_raw:
             row.status = "annotation_failed"
             row.error = "annotation response did not include an annotationId"
@@ -860,21 +979,34 @@ async def _run(
             row.status = "annotation_failed"
             row.error = f"malformed annotationId: {annotation_id_raw!r}"
             return
-        annotations_created += 1
+        if existing_ann_id:
+            annotations_updated += 1
+            row.annotation_action = "updated"
+        else:
+            annotations_created += 1
+            row.annotation_action = "created"
 
         raw_comment = (
             trace.feedback_preview or trace.error_summary or "Auto-graded"
         )[:_MAX_FEEDBACK_COMMENT_CHARS]
         comment = _sanitize_feedback_comment(raw_comment)
+        fb_body = {
+            "comment": comment,
+            "annotationId": str(row.annotation_id),
+        }
         try:
-            fb_resp = await client.post_json(
-                f"answers/{row.answer_id}/feedbacks",
-                json={
-                    "comment": comment,
-                    "annotationId": str(row.annotation_id),
-                },
-                headers=_bearer(token),
-            )
+            if existing_fb_id:
+                fb_resp = await client.put_json(
+                    f"answers/{row.answer_id}/feedbacks/{existing_fb_id}",
+                    json=fb_body,
+                    headers=_bearer(token),
+                )
+            else:
+                fb_resp = await client.post_json(
+                    f"answers/{row.answer_id}/feedbacks",
+                    json=fb_body,
+                    headers=_bearer(token),
+                )
         except AssessmentAPIStatusError as exc:
             # Log the exact request + response so upstream 5xx/4xx can be
             # diagnosed without re-running the grade. The comment string
@@ -883,11 +1015,13 @@ async def _run(
             # either its length or a specific character it can't handle
             # (apostrophes, backticks, control chars).
             logger.warning(
-                "pipeline: feedback POST failed status=%d answer_id=%s "
-                "annotation_id=%s comment_len=%d comment_preview=%r "
-                "upstream_body=%r",
+                "pipeline: feedback %s failed status=%d answer_id=%s "
+                "feedback_id=%s annotation_id=%s comment_len=%d "
+                "comment_preview=%r upstream_body=%r",
+                "PUT" if existing_fb_id else "POST",
                 exc.status_code,
                 row.answer_id,
+                existing_fb_id,
                 row.annotation_id,
                 len(comment),
                 comment[:200],
@@ -898,9 +1032,11 @@ async def _run(
             return
         except AssessmentAPIError as exc:
             logger.warning(
-                "pipeline: feedback POST errored answer_id=%s "
+                "pipeline: feedback %s errored answer_id=%s feedback_id=%s "
                 "comment_len=%d comment_preview=%r err=%s",
+                "PUT" if existing_fb_id else "POST",
                 row.answer_id,
+                existing_fb_id,
                 len(comment),
                 comment[:200],
                 exc,
@@ -910,14 +1046,22 @@ async def _run(
             return
 
         fb_payload = (fb_resp or {}).get("payload") if isinstance(fb_resp, dict) else None
+        fb_id_raw: Any = None
         if isinstance(fb_payload, dict):
-            fb_id = fb_payload.get("feedbackId") or fb_payload.get("id")
-            if fb_id:
-                try:
-                    row.feedback_id = uuid.UUID(str(fb_id))
-                except Exception:
-                    pass
-        feedbacks_created += 1
+            fb_id_raw = fb_payload.get("feedbackId") or fb_payload.get("id")
+        if not fb_id_raw and existing_fb_id:
+            fb_id_raw = existing_fb_id
+        if fb_id_raw:
+            try:
+                row.feedback_id = uuid.UUID(str(fb_id_raw))
+            except Exception:
+                pass
+        if existing_fb_id:
+            feedbacks_updated += 1
+            row.feedback_action = "updated"
+        else:
+            feedbacks_created += 1
+            row.feedback_action = "created"
         row.status = "graded"
 
     await asyncio.gather(*(_annotate_and_feedback(r) for r in answer_results))
@@ -984,7 +1128,9 @@ async def _run(
         answers_fetched=len(answers),
         answers_matched=matched_count,
         annotations_created=annotations_created,
+        annotations_updated=annotations_updated,
         feedbacks_created=feedbacks_created,
+        feedbacks_updated=feedbacks_updated,
         bulk_update_applied=bulk_update_applied,
         papers=paper_results,
         answers=answer_results,
